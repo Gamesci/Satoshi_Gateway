@@ -143,8 +143,7 @@ bool bitcoin_get_latest_job(Template *out) {
 // 声明 utils.c 中的函数
 void address_to_script(const char *addr, char *script_hex); 
 
-// 构建 Coinbase: 
-// 修复点：修正 total_len 计算逻辑，确保 VarInt 与实际数据长度完全一致。
+// 构建 Coinbase (修复版：符合 BIP34 动态高度编码)
 void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, char *c2, const char *default_witness) {
     int tag_len = strlen(msg);
     if(tag_len > 60) tag_len = 60; // 截断保护
@@ -153,21 +152,34 @@ void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, c
     int en2_size = g_config.extranonce2_size;
     int en_total = en1_size + en2_size;
     
+    // --- BIP34 高度动态编码 (修复点) ---
+    uint8_t h_enc[8];
+    int h_len = 0;
+    uint32_t temp_h = height;
+    
+    // 1. 最小化小端序编码
+    do {
+        h_enc[h_len++] = temp_h & 0xff;
+        temp_h >>= 8;
+    } while (temp_h > 0);
+
+    // 2. 处理符号位 (如果最高字节的最高位是1，需要补00，因为ScriptNum是有符号的)
+    if (h_enc[h_len - 1] & 0x80) {
+        h_enc[h_len++] = 0x00;
+    }
+
     // 计算 Tag Push Op 长度
-    // 如果 tag_len >= 76 (0x4c)，Opcode 是 2 字节 (4c + len)
-    // 否则是 1 字节 (len)
     int tag_push_len = (tag_len > 0) ? ((tag_len >= 76) ? 2 : 1) : 0;
 
     // ScriptSig 结构:
-    // [Height(4)] + [TagOp] + [Tag] + [ENOp(1)] + [EN(12)]
-    // 之前的版本多算了一个字节，导致 VarInt 错误
-    int total_len = 4 + tag_push_len + tag_len + 1 + en_total;
+    // [HeightPushOp(1)] + [HeightBytes(h_len)] + [TagOp] + [Tag] + [ENOp(1)] + [EN(en_total)]
+    int total_len = (1 + h_len) + tag_push_len + tag_len + 1 + en_total;
     
     // BIP34 限制 (100 bytes)
     if (total_len > 100) {
         tag_len = 0;
         tag_push_len = 0;
-        total_len = 4 + 1 + en_total; // 仅保留 Height + EN
+        total_len = (1 + h_len) + 1 + en_total; // 仅保留 Height + EN
     }
     
     // --- Coinb1 ---
@@ -177,10 +189,11 @@ void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, c
     // Script Length (VarInt)
     char len_hex[10]; sprintf(len_hex, "%02x", total_len); strcat(c1, len_hex);
     
-    // 1. BIP34 Height (4 bytes: 03 + 3 bytes height)
-    uint8_t h_le[4]; 
-    h_le[0]=height&0xff; h_le[1]=(height>>8)&0xff; h_le[2]=(height>>16)&0xff; h_le[3]=(height>>24)&0xff;
-    sprintf(c1 + strlen(c1), "03%02x%02x%02x", h_le[0], h_le[1], h_le[2]);
+    // 1. BIP34 Height (动态写入)
+    sprintf(c1 + strlen(c1), "%02x", h_len); // Push Opcode
+    for(int i=0; i<h_len; i++) {
+        sprintf(c1 + strlen(c1), "%02x", h_enc[i]);
+    }
     
     // 2. Pool Tag (移至 Coinb1, 位于 EN 之前)
     if (tag_len > 0) {

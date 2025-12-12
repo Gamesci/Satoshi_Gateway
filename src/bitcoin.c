@@ -8,11 +8,14 @@
 #include "bitcoin.h"
 #include "config.h"
 #include "stratum.h"
-#include "utils.h" // 包含 address_to_script 声明
+#include "utils.h"
 #include "sha256.h"
 
 static Template g_current_tmpl = {0};
 static pthread_mutex_t g_tmpl_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// 前置声明
+void address_to_script(const char *addr, char *script_hex);
 
 struct MemoryStruct { char *memory; size_t size; };
 static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp) {
@@ -224,6 +227,7 @@ int bitcoin_submit_block(const char *hex_data) {
         if(json_is_null(res)) {
             success = 1;
         } else {
+            // 这里会打印具体的错误原因 (high-hash, bad-txns等)
             log_error("Submit Block Rejected: %s", json_string_value(res));
         }
         json_decref(resp);
@@ -249,14 +253,20 @@ int bitcoin_reconstruct_and_submit(const char *job_id, const char *full_extranon
     char *block_hex = malloc(total_size * 2);
     char *p = block_hex;
     
+    // --- 1. 重构 Block Header ---
     uint8_t header[80];
+    
+    // Version: 使用 Little Endian 写入 (x86 默认)
+    // 关键修正: 这里不需要 Swap，因为 version_int 已经是正确的数值
     uint32_t ver = (version_mask != 0) ? version_mask : g_current_tmpl.version_int;
     *(uint32_t*)(header) = ver; 
     
+    // PrevHash: 已经转为 Little Endian (Stratum格式)，直接复制即可
     uint8_t prev_bin[32];
     hex2bin(g_current_tmpl.prev_hash, prev_bin, 32);
     memcpy(header+4, prev_bin, 32);
     
+    // Merkle Root
     uint8_t coinbase_bin[4096];
     size_t cb_len = strlen(coinbase_hex) / 2;
     hex2bin(coinbase_hex, coinbase_bin, cb_len);
@@ -275,13 +285,21 @@ int bitcoin_reconstruct_and_submit(const char *job_id, const char *full_extranon
     }
     memcpy(header+36, current_hash, 32);
     
+    // Time & Bits: 关键修正!
+    // ntime 是 hex string (BE). strtoul 读取后数值是正确的。
+    // x86 内存写入时自动转为 LE。所以这里不需要 swap_uint32！
     uint32_t t_val = strtoul(ntime, NULL, 16);
-    *(uint32_t*)(header+68) = swap_uint32(t_val); 
+    *(uint32_t*)(header+68) = t_val; 
+    
+    // nbits_int 已经解析为整数
     *(uint32_t*)(header+72) = g_current_tmpl.nbits_int;
+    
+    // Nonce
     *(uint32_t*)(header+76) = nonce; 
     
     bin2hex(header, 80, p); p += 160;
     
+    // --- 2. 剩余部分 (Tx Count, Coinbase, Txs) ---
     uint8_t vi[9];
     int vi_len = encode_varint(vi, 1 + g_current_tmpl.tx_count);
     bin2hex(vi, vi_len, p); p += (vi_len * 2);
@@ -298,6 +316,7 @@ int bitcoin_reconstruct_and_submit(const char *job_id, const char *full_extranon
     return ret;
 }
 
+// -------------------------------------------------------------------
 void bitcoin_update_template(bool clean_jobs) {
     log_info("Fetching Block Template...");
     json_t *rules = json_array();
@@ -330,7 +349,6 @@ void bitcoin_update_template(bool clean_jobs) {
         return;
     }
     
-    // 宽容解析逻辑
     pthread_mutex_lock(&g_tmpl_lock);
     bitcoin_cleanup_template(&g_current_tmpl);
     
@@ -340,7 +358,8 @@ void bitcoin_update_template(bool clean_jobs) {
     
     g_current_tmpl.height = json_integer_value(json_object_get(res, "height"));
     
-    // Version: 优先使用 versionHex，缺失则回退到 version int
+    // Version: 关键修正！使用原始整数生成 Hex，不进行 Swap
+    // RPC version 是十进制整数，Stratum 需要 Big Endian Hex 字符串
     json_t *j_ver_hex = json_object_get(res, "versionHex");
     g_current_tmpl.version_int = json_integer_value(json_object_get(res, "version"));
     
@@ -348,8 +367,8 @@ void bitcoin_update_template(bool clean_jobs) {
         const char *ver_hex = json_string_value(j_ver_hex);
         strncpy(g_current_tmpl.version, ver_hex, 8);
     } else {
-        // Fallback: int to BE hex
-        sprintf(g_current_tmpl.version, "%08x", swap_uint32(g_current_tmpl.version_int));
+        // Fallback: 直接打印整数为 Hex (无需 swap，rpc 返回的 int 打印出来就是 BE Hex 形式)
+        sprintf(g_current_tmpl.version, "%08x", g_current_tmpl.version_int);
     }
     
     const char *bits = json_string_value(json_object_get(res, "bits"));
@@ -357,9 +376,12 @@ void bitcoin_update_template(bool clean_jobs) {
     else strcpy(g_current_tmpl.nbits, "1d00ffff");
     g_current_tmpl.nbits_int = strtoul(g_current_tmpl.nbits, NULL, 16);
     
+    // Time: 关键修正！不进行 Swap
+    // RPC curtime 是时间戳。Stratum 需要 BE Hex。
     g_current_tmpl.ntime_int = json_integer_value(json_object_get(res, "curtime"));
-    sprintf(g_current_tmpl.ntime, "%08x", swap_uint32(g_current_tmpl.ntime_int));
+    sprintf(g_current_tmpl.ntime, "%08x", g_current_tmpl.ntime_int);
     
+    // PrevHash: 保持 Reverse (正确)
     const char *prev = json_string_value(json_object_get(res, "previousblockhash"));
     if(prev) {
         uint8_t prev_bin[32];

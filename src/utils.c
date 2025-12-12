@@ -17,7 +17,7 @@ static void log_print(const char* level, const char* format, va_list args) {
     fprintf(stdout, "[%s] [%s] ", buf, level);
     vfprintf(stdout, format, args);
     fprintf(stdout, "\n");
-    fflush(stdout); // 强制刷新缓冲区，确保 Docker 实时显示
+    fflush(stdout);
 }
 
 void log_info(const char *format, ...) {
@@ -35,7 +35,6 @@ void log_error(const char *format, ...) {
 }
 
 void log_debug(const char *format, ...) {
-    // 默认开启调试日志以便排查问题
     va_list args;
     va_start(args, format);
     log_print("DEBUG", format, args);
@@ -202,4 +201,51 @@ int segwit_addr_decode(int* witver, uint8_t* witprog, size_t* witprog_len, const
     if (*witprog_len < 2 || *witprog_len > 40) return 0;
     if (*witver == 0 && *witprog_len != 20 && *witprog_len != 32) return 0;
     return 1;
+}
+
+// --- 关键修复：地址转Script实现 ---
+// 之前缺失了这个函数的实现，导致链接错误
+void address_to_script(const char *addr, char *script_hex) {
+    uint8_t buf[64];
+    size_t len = 0;
+    int witver;
+    
+    // 1. 尝试 Bech32 (SegWit)
+    if (segwit_addr_decode(&witver, buf, &len, "bc", addr) || 
+        segwit_addr_decode(&witver, buf, &len, "tb", addr) || 
+        segwit_addr_decode(&witver, buf, &len, "bcrt", addr)) {
+        uint8_t op_ver = (witver == 0) ? 0x00 : (0x50 + witver);
+        sprintf(script_hex, "%02x%02x", op_ver, (int)len);
+        char prog_hex[128];
+        bin2hex(buf, len, prog_hex);
+        strcat(script_hex, prog_hex);
+        return;
+    }
+    
+    // 2. 尝试 Base58Check (Legacy)
+    int ver = base58_decode_check(addr, buf, &len);
+    if (ver >= 0) {
+        // P2PKH (1...)
+        if (ver == 0 || ver == 111) { 
+            strcpy(script_hex, "76a914");
+            char hash_hex[41];
+            bin2hex(buf, len, hash_hex);
+            strcat(script_hex, hash_hex);
+            strcat(script_hex, "88ac");
+            return;
+        } 
+        // P2SH (3...)
+        else if (ver == 5 || ver == 196) { 
+            strcpy(script_hex, "a914");
+            char hash_hex[41];
+            bin2hex(buf, len, hash_hex);
+            strcat(script_hex, hash_hex);
+            strcat(script_hex, "87");
+            return;
+        }
+    }
+    
+    // 失败兜底
+    log_error("Invalid Address format: %s. Using OP_RETURN.", addr);
+    strcpy(script_hex, "6a04deadbeef"); 
 }

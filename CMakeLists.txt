@@ -4,7 +4,7 @@ project(satoshi_gateway C)
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -O2 -pthread -D_GNU_SOURCE")
 
-# 查找依赖
+# 查找依赖库
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(JANSSON REQUIRED jansson)
 pkg_check_modules(CURL REQUIRED libcurl)
@@ -12,7 +12,7 @@ find_package(OpenSSL REQUIRED)
 
 include_directories(${JANSSON_INCLUDE_DIRS} ${CURL_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR} src)
 
-# 源文件列表 (增加了 config.c)
+# 源代码列表
 set(SOURCES
     src/main.c
     src/config.c

@@ -144,9 +144,6 @@ bool bitcoin_get_latest_job(Template *out) {
 void address_to_script(const char *addr, char *script_hex); 
 
 // 构建 Coinbase: 
-// 修复点1: 升级交易版本为 Version 2 (02000000)，符合 SegWit/BIP68 标准
-// 修复点2: 使用 BIP34 动态高度编码，避免硬编码长度导致的校验错误
-// 修复点3: 调整 Pool Tag 位置至 ExtraNonce 之后 (Coinb2 开头)，兼容旧解析逻辑
 void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, char *c2, const char *default_witness) {
     int tag_len = strlen(msg);
     if(tag_len > 60) tag_len = 60; // 截断保护
@@ -155,7 +152,7 @@ void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, c
     int en2_size = g_config.extranonce2_size;
     int en_total = en1_size + en2_size;
     
-    // --- BIP34 高度动态编码 (关键修复) ---
+    // --- BIP34 高度动态编码 ---
     uint8_t h_enc[8];
     int h_len = 0;
     uint32_t temp_h = height;
@@ -166,7 +163,7 @@ void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, c
         temp_h >>= 8;
     } while (temp_h > 0);
 
-    // 2. 处理符号位 (如果最高字节的最高位是1，需要补00，因为ScriptNum是有符号的)
+    // 2. 处理符号位 (如果最高字节的最高位是1，需要补00)
     if (h_enc[h_len - 1] & 0x80) {
         h_enc[h_len++] = 0x00;
     }
@@ -175,7 +172,7 @@ void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, c
     int tag_push_len = (tag_len > 0) ? ((tag_len >= 76) ? 2 : 1) : 0;
 
     // ScriptSig 结构:
-    // [HeightPushOp(1)] + [HeightBytes(h_len)] + [ENOp(1)] + [EN(en_total)] + [TagOp] + [Tag]
+    // [HeightPushOp(1)] + [HeightBytes(h_len)] + [TagOp] + [Tag] + [ENOp(1)] + [EN(en_total)]
     int total_len = (1 + h_len) + tag_push_len + tag_len + 1 + en_total;
     
     // BIP34 限制 (100 bytes)
@@ -186,8 +183,8 @@ void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, c
     }
     
     // --- Coinb1 ---
-    // Header - 修复: 使用 Version 2 (02000000)
-    sprintf(c1, "020000000100000000000000000000000000000000000000000000000000000000ffffffff");
+    // Header - 必须使用 Version 1 (01000000)
+    sprintf(c1, "010000000100000000000000000000000000000000000000000000000000000000ffffffff");
     
     // Script Length (VarInt)
     char len_hex[10]; sprintf(len_hex, "%02x", total_len); strcat(c1, len_hex);
@@ -196,22 +193,21 @@ void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, c
     sprintf(c1 + strlen(c1), "%02x", h_len); // Push Opcode
     for(int i=0; i<h_len; i++) sprintf(c1 + strlen(c1), "%02x", h_enc[i]);
     
-    // 2. ExtraNonce Push Op (Coinb1 结尾)
+    // 2. Pool Tag (位于 ExtraNonce 之前)
+    if (tag_len > 0) {
+        if (tag_len >= 76) sprintf(c1 + strlen(c1), "4c%02x", tag_len);
+        else sprintf(c1 + strlen(c1), "%02x", tag_len);
+        
+        for(int i=0; i<tag_len; i++) sprintf(c1 + strlen(c1), "%02x", (unsigned char)msg[i]);
+    }
+    
+    // 3. ExtraNonce Push Op (Coinb1 结尾)
     // 矿机会在后面追加 EN1 + EN2
     sprintf(c1 + strlen(c1), "%02x", en_total); 
     
     // --- Coinb2 ---
-    // 3. Pool Tag (位于 ExtraNonce 之后)
-    c2[0] = '\0';
-    if (tag_len > 0) {
-        if (tag_len >= 76) sprintf(c2, "4c%02x", tag_len);
-        else sprintf(c2, "%02x", tag_len);
-        
-        for(int i=0; i<tag_len; i++) sprintf(c2 + strlen(c2), "%02x", (unsigned char)msg[i]);
-    }
-
     // 4. Sequence
-    strcat(c2, "ffffffff"); 
+    sprintf(c2, "ffffffff"); 
     
     // Outputs
     int output_count = (default_witness && strlen(default_witness) > 0) ? 2 : 1;

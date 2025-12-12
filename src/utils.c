@@ -17,7 +17,7 @@ static void log_print(const char* level, const char* format, va_list args) {
     fprintf(stdout, "[%s] [%s] ", buf, level);
     vfprintf(stdout, format, args);
     fprintf(stdout, "\n");
-    fflush(stdout);
+    fflush(stdout); // 强制刷新缓冲区，确保 Docker 实时显示
 }
 
 void log_info(const char *format, ...) {

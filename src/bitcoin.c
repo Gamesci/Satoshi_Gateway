@@ -5,7 +5,7 @@
 #include <jansson.h>
 #include <unistd.h>
 #include <pthread.h>
-#include <math.h> 
+#include <sys/stat.h>
 #include "bitcoin.h"
 #include "config.h"
 #include "stratum.h"
@@ -18,7 +18,6 @@ static pthread_mutex_t g_tmpl_lock = PTHREAD_MUTEX_INITIALIZER;
 
 // --- 辅助工具函数 ---
 
-// 32字节大端比较: -1 if a < b, 0 if a == b, 1 if a > b
 static int cmp256(const uint8_t *a, const uint8_t *b) {
     for (int i = 0; i < 32; i++) {
         if (a[i] < b[i]) return -1;
@@ -27,7 +26,6 @@ static int cmp256(const uint8_t *a, const uint8_t *b) {
     return 0;
 }
 
-// 将 nbits (compact) 转为 256位 大端 Target
 static void nbits_to_target(uint32_t nbits, uint8_t *target) {
     memset(target, 0, 32);
     int exponent = nbits >> 24;
@@ -49,26 +47,24 @@ static void nbits_to_target(uint32_t nbits, uint8_t *target) {
     }
 }
 
-// 将难度值 (double) 转为 256位 大端 Target
-static void diff_to_target(double diff, uint8_t *target) {
-    // Max Target (Diff 1) = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
-    // roughly 2^224 - 1 (simplified)
-    // Target = Max / Diff
-    memset(target, 0, 32);
+void backup_block_to_disk(const char *block_hex) {
+    #ifdef _WIN32
+        _mkdir("backup");
+    #else
+        mkdir("backup", 0777);
+    #endif
+
+    char filename[128];
+    snprintf(filename, sizeof(filename), "backup/block_%ld.hex", (long)time(NULL));
     
-    // 简化处理：仅用于高位估算验证 Share
-    // 真实矿池需要高精度大数库 (OpenSSL Bignum / GMP)
-    // 这里使用简化的位移模拟
-    if (diff <= 0) diff = 1;
-    
-    // 0x00000000FFFF... is approximately 2^224.
-    double t = 2.6959535291011309493156476344724e67 / diff; // 2^224 / diff
-    
-    // 这是一个非常粗略的转换，仅用于验证 Share 是否由于极其荒谬的错误而被拒绝
-    // 生产环境必须引入 bignum 库。
-    // 为保持无依赖，这里不做完整实现，而是信任 difficulty 1 (pool min diff)
-    // 只要 Share Hash 前 32 位为 0，基本满足 Diff 1。
-    // Satoshi_Gateway 依赖外部配置 initial_diff
+    FILE *f = fopen(filename, "w");
+    if (f) {
+        fprintf(f, "%s", block_hex);
+        fclose(f);
+        log_info("Block backup saved to %s", filename);
+    } else {
+        log_error("Failed to write block backup to %s", filename);
+    }
 }
 
 // --- CURL 处理 ---
@@ -141,17 +137,20 @@ bool bitcoin_get_latest_job(Template *out) {
     return true;
 }
 
-// 前置声明
-void address_to_script(const char *addr, char *script_hex);
+void address_to_script(const char *addr, char *script_hex); // Forward decl from utils or external lib
 
 void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, char *c2, const char *default_witness) {
-    int tag_len = strlen(msg); if(tag_len > 32) tag_len = 32;
+    int tag_len = strlen(msg); 
+    // 安全截断：限制 Tag 长度，防止 ScriptSig 溢出
+    if(tag_len > 60) tag_len = 60;
+    
     int en1_size = 4;
     int en2_size = g_config.extranonce2_size;
     int en_total = en1_size + en2_size;
     
     // VarInt Length: Height(4) + PUSH_EN(1) + EN(12) + PUSH_TAG(1) + TAG(N)
     int total_len = 4 + 1 + en_total + 1 + tag_len;
+    if (total_len > 100) { total_len = 100; tag_len = 100 - (4 + 1 + en_total + 1); }
     
     sprintf(c1, "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff");
     char len_hex[10]; sprintf(len_hex, "%02x", total_len); strcat(c1, len_hex);
@@ -162,7 +161,6 @@ void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, c
     // PUSH Opcode for ExtraNonce
     sprintf(c1 + strlen(c1), "%02x", en_total); 
     
-    // C2 Start: Tags
     sprintf(c2, "%02x", tag_len); 
     char tag_hex[128] = {0};
     for(int i=0; i<tag_len; i++) sprintf(tag_hex + i*2, "%02x", (unsigned char)msg[i]);
@@ -201,18 +199,13 @@ void calculate_merkle_branch(json_t *txs, Template *tmpl) {
         
         tmpl->tx_hexs[i] = strdup(dat);
         
-        // 关键修复: Merkle Branch 计算时保持 LE (TxID 字节序)，不要反转。
-        // Stratum 协议要求发送给矿机的是 LE Hex。
-        // 我们计算过程全程用 LE，最后转 Hex 也是 LE，完美匹配。
+        // 关键修复: Merkle Branch 计算保留 LE，不反转
         hex2bin(tid, leaves[i+1], 32); 
     }
     
     int level = total; int idx = 0;
     while (level > 1) {
-        if (level > 1) { 
-            char h[65]; bin2hex(leaves[1], 32, h); 
-            strcpy(tmpl->merkle_branch[idx++], h); 
-        }
+        if (level > 1) { char h[65]; bin2hex(leaves[1], 32, h); strcpy(tmpl->merkle_branch[idx++], h); }
         int next = 0;
         for (int i = 0; i < level; i += 2) {
             uint8_t *l = leaves[i]; uint8_t *r = (i+1 < level) ? leaves[i+1] : leaves[i];
@@ -241,7 +234,6 @@ int bitcoin_submit_block(const char *hex_data) {
     return success;
 }
 
-// 参数 version_bits 是矿机提交的版本位
 int bitcoin_validate_and_submit(const char *job_id, const char *full_extranonce, const char *ntime, uint32_t nonce, uint32_t version_bits) {
     pthread_mutex_lock(&g_tmpl_lock);
     
@@ -257,8 +249,7 @@ int bitcoin_validate_and_submit(const char *job_id, const char *full_extranonce,
     
     uint8_t head[80];
     
-    // 关键修复: Version Rolling 逻辑
-    // final_version = (job_version & ~mask) | (miner_version & mask)
+    // 关键修复: Version Rolling 使用 Mask
     uint32_t ver = job->version_val;
     if (g_config.version_mask != 0) {
         ver = (ver & ~g_config.version_mask) | (version_bits & g_config.version_mask);
@@ -269,8 +260,6 @@ int bitcoin_validate_and_submit(const char *job_id, const char *full_extranonce,
     
     uint8_t cbin[4096]; size_t clen = strlen(coin)/2; hex2bin(coin, cbin, clen);
     uint8_t root[32]; sha256_double(cbin, clen, root);
-    
-    // Merkle Root 组合 (Assuming merkle_branch hex strings are LE now, which implies binary LE)
     for (int i=0; i<job->merkle_count; i++) {
         uint8_t br[32]; hex2bin(job->merkle_branch[i], br, 32);
         uint8_t cat[64]; memcpy(cat, root, 32); memcpy(cat+32, br, 32); sha256_double(cat, 64, root);
@@ -280,45 +269,37 @@ int bitcoin_validate_and_submit(const char *job_id, const char *full_extranonce,
     uint32_t tv = strtoul(ntime, NULL, 16); *(uint32_t*)(head+68) = tv; 
     *(uint32_t*)(head+72) = job->nbits_val; 
     
-    // 关键修复: Nonce 直接赋值 (LE to LE), 不做 swap
+    // 关键修复: Nonce 直接赋值不 swap
     *(uint32_t*)(head+76) = nonce; 
     
-    // 计算区块哈希 (Double SHA256)
-    // 结果 h 是 LE 字节序
     uint8_t h[32]; sha256_double(head, 80, h); 
     
-    // 准备大端哈希用于比较 (BE)
-    uint8_t h_be[32]; 
-    for(int i=0; i<32; i++) h_be[i] = h[31-i];
+    // BE Hash 用于比较
+    uint8_t h_be[32]; for(int i=0; i<32; i++) h_be[i] = h[31-i];
+    char hh[65]; bin2hex(h_be, 32, hh);
     
-    char hh[65]; bin2hex(h_be, 32, hh); // 打印日志用
-    
-    int result = 0; // 0=Stale/Reject, 1=Share, 2=Block
+    int result = 0; // 0=Bad, 1=Share, 2=Block
 
-    // 1. 验证 Share 难度 (Pool Diff)
-    // 简化: 检查哈希是否足够小。 
-    // 生产环境应: if (cmp256(h_be, pool_target) <= 0)
-    // 这里简单检查前 4 字节是否为 0 (近似 Diff 1)
+    // 1. 验证 Share (简化: 只要前4字节为0认为有效)
     if (h_be[0] == 0 && h_be[1] == 0 && h_be[2] == 0 && h_be[3] == 0) {
          result = 1;
-    } else {
-        // 低难度 Share，丢弃但记录
-        // pthread_mutex_unlock(&g_tmpl_lock); free(block); return 0; 
     }
 
-    // 2. 验证 区块 难度 (Network Target)
+    // 2. 验证 Network Target
     uint8_t target[32];
     nbits_to_target(job->nbits_val, target);
     
     if (cmp256(h_be, target) <= 0) {
         log_info(">>> BLOCK FOUND! Hash: %s", hh);
         
-        // 组装并提交区块
         bin2hex(head, 80, p); p += 160;
         uint8_t vi[9]; int vl = encode_varint(vi, 1 + job->tx_count);
         bin2hex(vi, vl, p); p += vl * 2;
         strcpy(p, coin); p += strlen(coin);
         for(int i=0; i<job->tx_count; i++) { strcpy(p, job->tx_hexs[i]); p += strlen(job->tx_hexs[i]); }
+        
+        // 调用备份
+        backup_block_to_disk(block);
         
         if (bitcoin_submit_block(block)) {
             result = 2;
@@ -366,9 +347,7 @@ void bitcoin_update_template(bool force_clean) {
     else sprintf(curr->version_hex, "%08x", curr->version_val);
     
     memcpy(curr->prev_hash_bin, prev_bin, 32);
-    // PrevHash 发送给 Stratum 矿机通常需要进行 32-bit swap (每4字节反转)
-    // 大多数矿机需要 Big Endian 的 32-bit chunks
-    // 这里使用 swap32_buffer，确保兼容性
+    // Stratum prevhash 需 swap32
     uint8_t swap[32]; memcpy(swap, prev_bin, 32); swap32_buffer(swap, 32);
     bin2hex(swap, 32, curr->prev_hash_stratum);
     

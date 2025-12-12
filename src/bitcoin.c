@@ -119,8 +119,8 @@ bool bitcoin_get_current_job_copy(Template *out) {
     return true;
 }
 
-// 复用 build_coinbase 逻辑
 void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, char *c2, const char *default_witness) {
+    // Part 1
     sprintf(c1, "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff");
     uint8_t h_le[4];
     h_le[0]=height&0xff; h_le[1]=(height>>8)&0xff; h_le[2]=(height>>16)&0xff; h_le[3]=(height>>24)&0xff;
@@ -132,6 +132,7 @@ void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, c
     sprintf(script_sig, "2003%02x%02x%02x14%s", h_le[0], h_le[1], h_le[2], tag_hex);
     strcat(c1, script_sig);
 
+    // Part 2
     sprintf(c2, "ffffffff02"); 
     char val_hex[17];
     sprintf(val_hex, "%016lx", value);
@@ -303,7 +304,7 @@ int bitcoin_reconstruct_and_submit(const char *job_id, const char *full_extranon
 }
 
 // -------------------------------------------------------------------
-// 核心修复区域：宽容模式解析 + 详细调试日志
+// 核心逻辑: 宽容的 GBT 解析
 // -------------------------------------------------------------------
 void bitcoin_update_template(bool clean_jobs) {
     log_info("Fetching Block Template...");
@@ -317,44 +318,27 @@ void bitcoin_update_template(bool clean_jobs) {
     
     json_t *resp = rpc_call("getblocktemplate", params);
     
-    // 1. 基础检查
     if(!resp) {
-        log_error("RPC Call returned NULL. Check connection.");
+        log_error("RPC Call returned NULL.");
         return;
     }
 
-    // 2. 错误处理
     json_t *error = json_object_get(resp, "error");
     if (error && !json_is_null(error)) {
         json_t *msg = json_object_get(error, "message");
-        const char *err_msg = json_is_string(msg) ? json_string_value(msg) : "Unknown";
-        log_error("Node Error: %s", err_msg);
+        log_error("Node Error: %s", json_is_string(msg) ? json_string_value(msg) : "Unknown");
         json_decref(resp);
         return;
     }
 
     json_t *res = json_object_get(resp, "result");
     if (!res || !json_is_object(res)) {
-        log_error("Invalid RPC: result is missing or not object");
+        log_error("Invalid RPC: result is missing");
         json_decref(resp);
         return;
     }
     
-    // 3. 字段检查 (Debug Mode)
-    // 如果 versionHex 缺失，尝试回退到 version
-    json_t *j_ver_hex = json_object_get(res, "versionHex");
-    json_t *j_prev = json_object_get(res, "previousblockhash");
-    json_t *j_bits = json_object_get(res, "bits");
-
-    if (!j_prev || !j_bits) {
-        // 如果关键字段真的没了，打印原始数据
-        char *dump = json_dumps(res, 0);
-        log_error("[DEBUG] Raw GBT Response (Missing keys): %s", dump);
-        free(dump);
-        json_decref(resp);
-        return;
-    }
-
+    // 移除强制的 Missing Fields 检查，改为尝试读取
     pthread_mutex_lock(&g_tmpl_lock);
     
     bitcoin_cleanup_template(&g_current_tmpl);
@@ -364,49 +348,45 @@ void bitcoin_update_template(bool clean_jobs) {
     g_current_tmpl.clean_jobs = clean_jobs;
     
     g_current_tmpl.height = json_integer_value(json_object_get(res, "height"));
+    
+    // Version 处理 (兼容 Libre Relay 可能不返回 versionHex)
+    json_t *j_ver_hex = json_object_get(res, "versionHex");
     g_current_tmpl.version_int = json_integer_value(json_object_get(res, "version"));
-
-    // VersionHex 处理 (兼容性修复)
+    
     if (j_ver_hex) {
         const char *ver_hex = json_string_value(j_ver_hex);
         strncpy(g_current_tmpl.version, ver_hex, 8);
     } else {
-        // 如果没有 versionHex，手动把 versionInt 转为 BE Hex
-        // RPC version 通常是十进制 int。Stratum 需要 BE Hex 字符串。
-        // 例如 version=536870912 (0x20000000). Hex="20000000".
-        // 注意：Swap? 
-        // 之前代码: sprintf(..., swap_uint32(ver_int))
-        // 通常 versionHex 已经是 BE。如果它是 Int，在 x86 内存是 LE。
-        // 我们直接按 BE 打印它。
-        uint32_t v = g_current_tmpl.version_int;
-        // 尝试 Swap 后打印 (模仿 RPC 行为)
-        sprintf(g_current_tmpl.version, "%08x", swap_uint32(v));
-        log_info("[WARN] Missing versionHex, generated from version: %s", g_current_tmpl.version);
+        // 如果没有 Hex，用整数生成 BE Hex
+        sprintf(g_current_tmpl.version, "%08x", swap_uint32(g_current_tmpl.version_int));
     }
     
-    // Bits
-    const char *bits_str = json_string_value(j_bits);
-    strncpy(g_current_tmpl.nbits, bits_str, 8);
+    const char *bits = json_string_value(json_object_get(res, "bits"));
+    if(bits) strncpy(g_current_tmpl.nbits, bits, 8);
+    else strcpy(g_current_tmpl.nbits, "1d00ffff"); // Fallback
     g_current_tmpl.nbits_int = strtoul(g_current_tmpl.nbits, NULL, 16);
     
-    // Time
     g_current_tmpl.ntime_int = json_integer_value(json_object_get(res, "curtime"));
     sprintf(g_current_tmpl.ntime, "%08x", swap_uint32(g_current_tmpl.ntime_int));
     
-    // PrevHash
-    const char *prev = json_string_value(j_prev);
-    uint8_t prev_bin[32];
-    hex2bin(prev, prev_bin, 32);
-    reverse_bytes(prev_bin, 32); 
-    bin2hex(prev_bin, 32, g_current_tmpl.prev_hash);
+    // PrevHash 处理
+    const char *prev = json_string_value(json_object_get(res, "previousblockhash"));
+    if(prev) {
+        uint8_t prev_bin[32];
+        hex2bin(prev, prev_bin, 32);
+        reverse_bytes(prev_bin, 32); 
+        bin2hex(prev_bin, 32, g_current_tmpl.prev_hash);
+    } else {
+        // 如果连 PrevHash 都没有，可能是创世块或者严重错误
+        log_error("PrevHash missing! Check Node.");
+        memset(g_current_tmpl.prev_hash, '0', 64);
+    }
     
-    // Coinbase
     int64_t coin_val = json_integer_value(json_object_get(res, "coinbasevalue"));
     const char *def_wit = json_string_value(json_object_get(res, "default_witness_commitment"));
     build_coinbase(g_current_tmpl.height, coin_val, g_config.coinbase_tag, 
                    g_current_tmpl.coinb1, g_current_tmpl.coinb2, def_wit);
     
-    // Merkle
     json_t *txs = json_object_get(res, "transactions");
     if(txs) calculate_merkle_branch(txs, &g_current_tmpl);
     else g_current_tmpl.merkle_count = 0;

@@ -1,0 +1,14 @@
+{
+  "rpc_host": "127.0.0.1:8332",
+  "rpc_user": "user",
+  "rpc_pass": "password",
+  "zmq_pub_hashblock": "tcp://127.0.0.1:28332",
+  "reward_address": "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+  "pool_tag": "/Satoshi_Gateway/",
+  "listen_port": 3333,
+  "poll_interval": "30",
+  "diff_asic": 1024,
+  "vardiff_target_shares_min": 20,
+  "extranonce2_size": 8,
+  "version_mask": "1fffe000"
+}

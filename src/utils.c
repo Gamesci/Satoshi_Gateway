@@ -3,8 +3,11 @@
 #include <time.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include "utils.h"
 #include "sha256.h"
+
+// --- 日志与基础工具 ---
 
 void log_info(const char *fmt, ...) {
     char buf[1024]; va_list args;
@@ -21,9 +24,7 @@ void log_error(const char *fmt, ...) {
 }
 
 void hex2bin(const char *hex, uint8_t *bin, size_t len) {
-    for(size_t i=0; i<len; i++) {
-        sscanf(hex+i*2, "%2hhx", &bin[i]);
-    }
+    for(size_t i=0; i<len; i++) sscanf(hex+i*2, "%2hhx", &bin[i]);
 }
 
 void bin2hex(const uint8_t *bin, size_t len, char *hex) {
@@ -48,9 +49,8 @@ uint32_t swap_uint32(uint32_t val) {
     return ((val>>24)&0xff) | ((val<<8)&0xff0000) | ((val>>8)&0xff00) | ((val<<24)&0xff000000);
 }
 
-// --- Address Decoding Implementation ---
+// --- Base58 Implementation ---
 
-static const char *b58digits = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 static const int8_t b58values[128] = {
     -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
     -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
@@ -79,17 +79,111 @@ int base58_decode(const char *str, uint8_t *out) {
     return 1;
 }
 
-// Simplified Bech32 Decode for P2WPKH/P2WSH (assumes 'bc1' prefix and valid checksum)
-// A full robust implementation is large, this extracts the witness program.
-// NOTE: For production, link libbech32 or similar. This is a minimal heuristic parser for P2WPKH.
-int bech32_extract_witness(const char *addr, uint8_t *out, int *out_len) {
-    if (strncmp(addr, "bc1q", 4) != 0) return 0;
-    // ... Minimal decoder is too complex to inline fully robustly without ~200 lines.
-    // However, if we assume user provides valid P2PKH (Base58), we handle it.
-    // For P2WPKH, if we can't fully decode, we log warning.
-    // For this context, I will implement a placeholder that warns if not Base58.
-    // BUT to fix the linker error, the function must exist.
-    return 0; 
+// --- Bech32 Implementation (BIP173/BIP350) ---
+
+uint32_t bech32_polymod_step(uint32_t pre) {
+    uint32_t b = pre >> 25;
+    return ((pre & 0x1FFFFFF) << 5) ^
+           (-((b >> 0) & 1) & 0x3b6a57b2UL) ^
+           (-((b >> 1) & 1) & 0x26508e6dUL) ^
+           (-((b >> 2) & 1) & 0x1ea119faUL) ^
+           (-((b >> 3) & 1) & 0x3d4233ddUL) ^
+           (-((b >> 4) & 1) & 0x2a1462b3UL);
+}
+
+static const int8_t bech32_values[128] = {
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    15, -1, 10, 17, 21, 20, 26, 30,  7,  5, -1, -1, -1, -1, -1, -1,
+    -1, 29, -1, 24, 13, 25,  9,  8, 23, -1, 18, 22, 31, 27, 19, -1,
+     1,  0,  3, 16, 11, 28, 12, 14,  6,  4,  2, -1, -1, -1, -1, -1,
+    -1, 29, -1, 24, 13, 25,  9,  8, 23, -1, 18, 22, 31, 27, 19, -1,
+     1,  0,  3, 16, 11, 28, 12, 14,  6,  4,  2, -1, -1, -1, -1, -1
+};
+
+// Convert from 5-bit groups to 8-bit groups
+int convert_bits(uint8_t* out, size_t* outlen, int outbits, const uint8_t* in, size_t inlen, int inbits, int pad) {
+    uint32_t val = 0;
+    int bits = 0;
+    uint32_t maxv = (((uint32_t)1) << outbits) - 1;
+    size_t out_pos = 0;
+    for (size_t i = 0; i < inlen; ++i) {
+        val = (val << inbits) | in[i];
+        bits += inbits;
+        while (bits >= outbits) {
+            bits -= outbits;
+            out[out_pos++] = (val >> bits) & maxv;
+        }
+    }
+    if (pad) {
+        if (bits) {
+            out[out_pos++] = (val << (outbits - bits)) & maxv;
+        }
+    } else if (((val << (outbits - bits)) & maxv) || bits >= inbits) {
+        return 0;
+    }
+    *outlen = out_pos;
+    return 1;
+}
+
+int segwit_addr_decode(int* witver, uint8_t* witprog, size_t* witprog_len, const char* hrp, const char* addr) {
+    uint32_t chk = 1;
+    size_t i;
+    const char *data_part = NULL;
+    
+    // Check HRP and find separator
+    size_t hrp_len = strlen(hrp);
+    if (strncmp(addr, hrp, hrp_len) != 0) return 0;
+    if (addr[hrp_len] != '1') return 0;
+    data_part = addr + hrp_len + 1;
+    
+    // Calculate checksum of HRP
+    for (i = 0; i < hrp_len; ++i) chk = bech32_polymod_step(chk) ^ (hrp[i] & 0x1f); // lower 5 bits
+    // HRP upper 3 bits are processed implicitly in standard impl, simplified here assumes lowercase ASCII HRP
+    
+    // Process data part (values)
+    size_t data_len = strlen(data_part);
+    if (data_len < 6) return 0;
+    
+    uint8_t values[128]; // max 90 chars typically
+    if (data_len > 127) return 0;
+
+    // Reset chk to re-calculate properly including the high bits trick
+    chk = 1;
+    for (i = 0; i < hrp_len; ++i) chk = bech32_polymod_step(chk) ^ (hrp[i] >> 5);
+    chk = bech32_polymod_step(chk);
+    for (i = 0; i < hrp_len; ++i) chk = bech32_polymod_step(chk) ^ (hrp[i] & 0x1f);
+
+    for (i = 0; i < data_len; ++i) {
+        int v = (int)data_part[i];
+        if (v < 0 || v > 127) return 0;
+        int8_t val = bech32_values[v];
+        if (val == -1) return 0;
+        values[i] = val;
+        chk = bech32_polymod_step(chk) ^ val;
+    }
+    
+    // Verify checksum (BIP173 constant 1, BIP350 constant 0x2bc830a3)
+    int spec = -1; // 1 = Bech32, 2 = Bech32m
+    if (chk == 1) spec = 1;
+    else if (chk == 0x2bc830a3) spec = 2;
+    else return 0;
+
+    // Witness version is the first data byte
+    *witver = values[0];
+    
+    // Convert remaining data (exclude version byte and 6 checksum bytes)
+    size_t prog_len_5bit = data_len - 1 - 6;
+    if (!convert_bits(witprog, witprog_len, 8, values + 1, prog_len_5bit, 5, 0)) return 0;
+    
+    if (*witver == 0 && spec != 1) return 0; // Version 0 must be Bech32
+    if (*witver != 0 && spec != 2) return 0; // Version 1+ must be Bech32m
+    
+    if (*witprog_len < 2 || *witprog_len > 40) return 0;
+    if (*witver == 0 && *witprog_len != 20 && *witprog_len != 32) return 0;
+    
+    return 1;
 }
 
 void address_to_script(const char *addr, char *script_hex) {
@@ -97,7 +191,6 @@ void address_to_script(const char *addr, char *script_hex) {
     if (addr[0] == '1' || addr[0] == '3' || addr[0] == 'm' || addr[0] == 'n' || addr[0] == '2') {
         uint8_t bin[25];
         if (base58_decode(addr, bin)) {
-            // Checksum validation skipped for brevity, but should be done in full prod
             uint8_t hash[20];
             memcpy(hash, bin + 1, 20); // Skip version byte
             
@@ -107,31 +200,48 @@ void address_to_script(const char *addr, char *script_hex) {
                 char h[41]; bin2hex(hash, 20, h);
                 strcat(script_hex, h);
                 strcat(script_hex, "88ac");
+                log_info("Decoded Base58 P2PKH: %s", addr);
                 return;
             } else if (addr[0] == '3' || addr[0] == '2') { // P2SH
-                // OP_HASH160 <len> <scriptHash> OP_EQUAL
                 sprintf(script_hex, "a914");
                 char h[41]; bin2hex(hash, 20, h);
                 strcat(script_hex, h);
                 strcat(script_hex, "87");
+                log_info("Decoded Base58 P2SH: %s", addr);
                 return;
             }
         }
     }
     
-    // 2. Try Bech32 (Segwit) - Minimal parsing for standard bc1q... (P2WPKH)
-    // NOTE: This is a hacky fallback. In strict production, compile with thirdparty_segwit_addr.c
-    if (strncmp(addr, "bc1q", 4) == 0 && strlen(addr) == 42) {
-        // P2WPKH (version 0, 20 bytes witness program)
-        // BECH32 encoding is complex. If using P2WPKH, please set address in config.
-        // For now, if we cannot decode, we default to a standard BURN script or error log.
-        log_error("Bech32 address decoding requires full implementation. Please use P2PKH (starts with 1) for this lightweight gateway, or update utils.c with full bech32 logic.");
-        // Fallback: Generate an OP_RETURN script to avoid crashing, but funds will be lost.
-        strcpy(script_hex, "6a"); // OP_RETURN (Safety)
-        return;
+    // 2. Try Segwit (Bech32)
+    // Supports bc1q... (P2WPKH/P2WSH) and bc1p... (Taproot)
+    if (strncmp(addr, "bc1", 3) == 0 || strncmp(addr, "tb1", 3) == 0 || strncmp(addr, "bcrt1", 5) == 0) {
+        int witver;
+        uint8_t witprog[40];
+        size_t witprog_len = 40;
+        
+        const char *hrp = "bc"; // Mainnet default
+        if (strncmp(addr, "tb1", 3) == 0) hrp = "tb";
+        else if (strncmp(addr, "bcrt1", 5) == 0) hrp = "bcrt";
+        
+        if (segwit_addr_decode(&witver, witprog, &witprog_len, hrp, addr)) {
+            // Segwit Output: OP_n <len> <program>
+            // OP_0 = 0x00, OP_1 = 0x51 ... OP_16 = 0x60
+            if (witver == 0) sprintf(script_hex, "00");
+            else sprintf(script_hex, "%02x", 0x50 + witver);
+            
+            char len_hex[4]; sprintf(len_hex, "%02x", (int)witprog_len);
+            strcat(script_hex, len_hex);
+            
+            char prog_hex[81]; bin2hex(witprog, witprog_len, prog_hex);
+            strcat(script_hex, prog_hex);
+            
+            log_info("Decoded Bech32 Segwit (v%d): %s", witver, addr);
+            return;
+        }
     }
 
-    // Default/Error
-    log_error("Unsupported Address Format: %s. Using OP_RETURN.", addr);
+    // Decoding Failed
+    log_error("Failed to decode address: %s. Using BURN script (OP_RETURN).", addr);
     strcpy(script_hex, "6a");
 }

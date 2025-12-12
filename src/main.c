@@ -7,32 +7,43 @@
 #include "config.h"
 #include "bitcoin.h"
 #include "stratum.h"
+#include "utils.h" 
 
 volatile sig_atomic_t g_block_notify = 0;
 void handle_signal(int sig) { if(sig == SIGUSR1) g_block_notify = 1; }
 
 int main(int argc, char *argv[]) {
+    setbuf(stdout, NULL);
+    
     const char *conf_file = "config.json";
     if(argc > 2 && strcmp(argv[1], "-c") == 0) conf_file = argv[2];
     
-    if(load_config(conf_file) != 0) return 1;
+    log_info("Starting Satoshi Gateway...");
+    
+    if(load_config(conf_file) != 0) {
+        log_error("Config load failed.");
+        return 1;
+    }
     
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = handle_signal;
     sigaction(SIGUSR1, &sa, NULL);
     
+    signal(SIGPIPE, SIG_IGN);
+    
     if(bitcoin_init() != 0) return 1;
     if(stratum_start_thread() != 0) return 1;
     
-    printf("Gateway running on %d. RPC: %s\n", g_config.stratum_port, g_config.rpc_url);
+    log_info("Gateway running on port %d", g_config.stratum_port);
+    log_info("RPC Target: %s", g_config.rpc_url);
     
     bitcoin_update_template(true);
     time_t last_check = time(NULL);
     
     while(1) {
         if(g_block_notify) {
-            printf("New Block! Refreshing...\n");
+            log_info("Signal: New Block Detected!");
             g_block_notify = 0;
             bitcoin_update_template(true);
             last_check = time(NULL);

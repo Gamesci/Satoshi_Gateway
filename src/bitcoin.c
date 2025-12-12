@@ -143,7 +143,10 @@ bool bitcoin_get_latest_job(Template *out) {
 // 声明 utils.c 中的函数
 void address_to_script(const char *addr, char *script_hex); 
 
-// 构建 Coinbase: 
+// 构建 Coinbase (最终修正版): 
+// 1. 强制使用 Version 1 (01000000)
+// 2. 使用 BIP34 动态高度编码
+// 3. Pool Tag 放置在 ExtraNonce 之前 (Coinb1)，修复工具显示异常
 void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, char *c2, const char *default_witness) {
     int tag_len = strlen(msg);
     if(tag_len > 60) tag_len = 60; // 截断保护
@@ -163,7 +166,7 @@ void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, c
         temp_h >>= 8;
     } while (temp_h > 0);
 
-    // 2. 处理符号位 (如果最高字节的最高位是1，需要补00)
+    // 2. 处理符号位
     if (h_enc[h_len - 1] & 0x80) {
         h_enc[h_len++] = 0x00;
     }
@@ -183,7 +186,7 @@ void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, c
     }
     
     // --- Coinb1 ---
-    // Header - 必须使用 Version 1 (01000000)
+    // Header - Version 1 (01000000)
     sprintf(c1, "010000000100000000000000000000000000000000000000000000000000000000ffffffff");
     
     // Script Length (VarInt)
@@ -193,7 +196,7 @@ void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, c
     sprintf(c1 + strlen(c1), "%02x", h_len); // Push Opcode
     for(int i=0; i<h_len; i++) sprintf(c1 + strlen(c1), "%02x", h_enc[i]);
     
-    // 2. Pool Tag (位于 ExtraNonce 之前)
+    // 2. Pool Tag (插入在 ExtraNonce 之前)
     if (tag_len > 0) {
         if (tag_len >= 76) sprintf(c1 + strlen(c1), "4c%02x", tag_len);
         else sprintf(c1 + strlen(c1), "%02x", tag_len);

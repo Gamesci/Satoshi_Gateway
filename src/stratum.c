@@ -16,6 +16,7 @@
 static Client g_clients[MAX_CLIENTS];
 static pthread_mutex_t g_clients_lock = PTHREAD_MUTEX_INITIALIZER;
 
+// --- Duplicate Share Check ---
 #define SHARE_CACHE_SIZE 1024
 typedef struct { char key[128]; } ShareEntry;
 static ShareEntry g_share_cache[SHARE_CACHE_SIZE];
@@ -163,7 +164,6 @@ void *client_worker(void *arg) {
                         send_json(c->sock, dreq);
                         json_decref(dreq);
                         
-                        // 使用 malloc 分配临时 Template 防止栈溢出
                         Template *tmpl = malloc(sizeof(Template));
                         if(tmpl) {
                             if(bitcoin_get_latest_job(tmpl)) {
@@ -174,10 +174,14 @@ void *client_worker(void *arg) {
                         }
                     }
                     else if(strcmp(method, "mining.configure") == 0) {
+                         // CRITICAL FIX: Convert integer mask to hex string
+                         char mask_str[16];
+                         sprintf(mask_str, "%08x", g_config.version_mask);
+                         
                          json_object_set_new(res, "error", json_null());
                          json_t *r = json_object();
                          json_object_set_new(r, "version-rolling", json_true());
-                         json_object_set_new(r, "version-rolling.mask", json_string(g_config.version_mask));
+                         json_object_set_new(r, "version-rolling.mask", json_string(mask_str)); // Safe
                          json_object_set_new(res, "result", r);
                          send_json(c->sock, res);
                     }

@@ -17,7 +17,7 @@ static pthread_mutex_t g_tmpl_lock = PTHREAD_MUTEX_INITIALIZER;
 // 前置声明
 void address_to_script(const char *addr, char *script_hex);
 
-// --- 辅助函数 ---
+// CURL 辅助
 struct MemoryStruct { char *memory; size_t size; };
 static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp) {
     size_t realsize = size * nmemb;
@@ -95,14 +95,14 @@ void bitcoin_cleanup_template(Template *t) {
     t->tx_count = 0;
 }
 
-// --- 关键实现：获取任务副本 ---
+// 获取当前任务副本（线程安全）
 bool bitcoin_get_current_job_copy(Template *out) {
     pthread_mutex_lock(&g_tmpl_lock);
     if (strlen(g_current_tmpl.job_id) == 0) {
         pthread_mutex_unlock(&g_tmpl_lock);
         return false;
     }
-    // Deep Copy needed for safety
+    
     strcpy(out->job_id, g_current_tmpl.job_id);
     strcpy(out->prev_hash, g_current_tmpl.prev_hash);
     strcpy(out->coinb1, g_current_tmpl.coinb1);
@@ -111,7 +111,7 @@ bool bitcoin_get_current_job_copy(Template *out) {
     strcpy(out->nbits, g_current_tmpl.nbits);
     strcpy(out->ntime, g_current_tmpl.ntime);
     out->height = g_current_tmpl.height;
-    out->clean_jobs = false; // 新连接不强制 clean
+    out->clean_jobs = false;
     
     out->merkle_count = g_current_tmpl.merkle_count;
     for(int i=0; i<out->merkle_count; i++) {
@@ -122,11 +122,47 @@ bool bitcoin_get_current_job_copy(Template *out) {
     return true;
 }
 
-// ... address_to_script, build_coinbase, calculate_merkle_branch, encode_varint ...
-// (请保留之前的实现，为节省篇幅略去，逻辑不变)
-// 务必确保 `utils.c` 里实现了 `address_to_script` 所需的 base58/segwit
+void address_to_script(const char *addr, char *script_hex) {
+    uint8_t buf[64];
+    size_t len = 0;
+    int witver;
+    
+    // Bech32
+    if (segwit_addr_decode(&witver, buf, &len, "bc", addr) || 
+        segwit_addr_decode(&witver, buf, &len, "tb", addr) || 
+        segwit_addr_decode(&witver, buf, &len, "bcrt", addr)) {
+        uint8_t op_ver = (witver == 0) ? 0x00 : (0x50 + witver);
+        sprintf(script_hex, "%02x%02x", op_ver, (int)len);
+        char prog_hex[128];
+        bin2hex(buf, len, prog_hex);
+        strcat(script_hex, prog_hex);
+        return;
+    }
+    
+    // Base58
+    int ver = base58_decode_check(addr, buf, &len);
+    if (ver >= 0) {
+        if (ver == 0 || ver == 111) { // P2PKH
+            strcpy(script_hex, "76a914");
+            char hash_hex[41];
+            bin2hex(buf, len, hash_hex);
+            strcat(script_hex, hash_hex);
+            strcat(script_hex, "88ac");
+            return;
+        } else if (ver == 5 || ver == 196) { // P2SH
+            strcpy(script_hex, "a914");
+            char hash_hex[41];
+            bin2hex(buf, len, hash_hex);
+            strcat(script_hex, hash_hex);
+            strcat(script_hex, "87");
+            return;
+        }
+    }
+    
+    log_error("Invalid Address: %s. Using OP_RETURN.", addr);
+    strcpy(script_hex, "6a04deadbeef"); 
+}
 
-// 下面是 build_coinbase 示例，请确保代码中有它：
 void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, char *c2, const char *default_witness) {
     // Part 1
     sprintf(c1, "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff");
@@ -138,7 +174,7 @@ void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, c
     for(int i=0; msg[i] && i<20; i++) sprintf(tag_hex + i*2, "%02x", (unsigned char)msg[i]);
     
     char script_sig[256];
-    // Push Height(3) + Tag
+    // Length (VarInt) + 03(Push) + H(3) + ...
     sprintf(script_sig, "2003%02x%02x%02x14%s", h_le[0], h_le[1], h_le[2], tag_hex);
     strcat(c1, script_sig);
 
@@ -217,10 +253,116 @@ void calculate_merkle_branch(json_t *txs, Template *tmpl) {
     tmpl->merkle_count = branch_idx;
     free(leaves);
 }
-// -------------------------------------------------------------------
+
+int encode_varint(uint8_t *buf, uint64_t n) {
+    if (n < 0xfd) { buf[0] = n; return 1; }
+    else if (n <= 0xffff) { buf[0] = 0xfd; *(uint16_t*)(buf+1) = (uint16_t)n; return 3; }
+    else if (n <= 0xffffffff) { buf[0] = 0xfe; *(uint32_t*)(buf+1) = (uint32_t)n; return 5; }
+    else { buf[0] = 0xff; *(uint64_t*)(buf+1) = n; return 9; }
+}
+
+int bitcoin_submit_block(const char *hex_data) {
+    json_t *params = json_array();
+    json_array_append_new(params, json_string(hex_data));
+    json_t *resp = rpc_call("submitblock", params);
+    
+    int success = 0;
+    if(resp) {
+        json_t *res = json_object_get(resp, "result");
+        if(json_is_null(res)) {
+            success = 1;
+        } else {
+            log_error("Submit Block Rejected: %s", json_string_value(res));
+        }
+        json_decref(resp);
+    } else {
+        log_error("Submit Block Failed (RPC error)");
+    }
+    return success;
+}
+
+int bitcoin_reconstruct_and_submit(const char *job_id, const char *full_extranonce, const char *ntime, uint32_t nonce, uint32_t version_mask) {
+    pthread_mutex_lock(&g_tmpl_lock);
+    
+    if (strcmp(job_id, g_current_tmpl.job_id) != 0) {
+        pthread_mutex_unlock(&g_tmpl_lock);
+        return 0; 
+    }
+
+    char coinbase_hex[8192];
+    sprintf(coinbase_hex, "%s%s%s", g_current_tmpl.coinb1, full_extranonce, g_current_tmpl.coinb2);
+    
+    size_t total_size = 80 + 2048 + 2048; 
+    for(int i=0; i<g_current_tmpl.tx_count; i++) total_size += strlen(g_current_tmpl.tx_hexs[i]);
+    char *block_hex = malloc(total_size * 2);
+    char *p = block_hex;
+    
+    uint8_t header[80];
+    
+    // Version with rolling mask
+    uint32_t ver = (version_mask != 0) ? version_mask : g_current_tmpl.version_int;
+    *(uint32_t*)(header) = ver; 
+    
+    // PrevHash (Convert LE -> BE -> LE?)
+    // g_current_tmpl.prev_hash 是 Stratum (Little) 格式。
+    // Header 需要 Little 格式 (Internal)。
+    // 我们的 hex2bin 读取后就是内存字节。
+    // 验证: RPC (BE) -> reverse -> Stratum (LE).
+    // header[4] 内存直接拷贝。
+    // 如果 Stratum 是 LE，内存就是 LE。
+    // PrevHash 在 Header 中是 32 bytes Little Endian.
+    // 所以直接 hex2bin 即可。
+    uint8_t prev_bin[32];
+    hex2bin(g_current_tmpl.prev_hash, prev_bin, 32);
+    memcpy(header+4, prev_bin, 32);
+    
+    // Merkle Root
+    uint8_t coinbase_bin[4096];
+    size_t cb_len = strlen(coinbase_hex) / 2;
+    hex2bin(coinbase_hex, coinbase_bin, cb_len);
+    
+    uint8_t current_hash[32];
+    sha256_double(coinbase_bin, cb_len, current_hash);
+    
+    for (int i=0; i<g_current_tmpl.merkle_count; i++) {
+        uint8_t branch_bin[32];
+        hex2bin(g_current_tmpl.merkle_branch[i], branch_bin, 32);
+        
+        uint8_t concat[64];
+        memcpy(concat, current_hash, 32);
+        memcpy(concat+32, branch_bin, 32);
+        sha256_double(concat, 64, current_hash);
+    }
+    memcpy(header+36, current_hash, 32);
+    
+    // Time & Bits
+    uint32_t t_val = strtoul(ntime, NULL, 16);
+    *(uint32_t*)(header+68) = swap_uint32(t_val); // NTime is usually BE in Stratum
+    *(uint32_t*)(header+72) = g_current_tmpl.nbits_int; // Already LE int
+    *(uint32_t*)(header+76) = nonce; 
+    
+    bin2hex(header, 80, p); p += 160;
+    
+    uint8_t vi[9];
+    int vi_len = encode_varint(vi, 1 + g_current_tmpl.tx_count);
+    bin2hex(vi, vi_len, p); p += (vi_len * 2);
+    
+    strcpy(p, coinbase_hex); p += strlen(coinbase_hex);
+    
+    for(int i=0; i<g_current_tmpl.tx_count; i++) {
+        strcpy(p, g_current_tmpl.tx_hexs[i]);
+        p += strlen(g_current_tmpl.tx_hexs[i]);
+    }
+    
+    int ret = bitcoin_submit_block(block_hex);
+    
+    free(block_hex);
+    pthread_mutex_unlock(&g_tmpl_lock);
+    return ret;
+}
 
 void bitcoin_update_template(bool clean_jobs) {
-    log_info("Fetching GBT from node...");
+    log_info("Refreshing Block Template...");
     json_t *rules = json_array();
     json_array_append_new(rules, json_string("segwit"));
     json_array_append_new(rules, json_string("csv")); 
@@ -231,7 +373,7 @@ void bitcoin_update_template(bool clean_jobs) {
     
     json_t *resp = rpc_call("getblocktemplate", params);
     if(!resp || !json_object_get(resp, "result")) {
-        log_error("GetBlockTemplate failed. Node syncing?");
+        log_error("GetBlockTemplate failed.");
         if(resp) json_decref(resp);
         return;
     }
@@ -245,28 +387,27 @@ void bitcoin_update_template(bool clean_jobs) {
     snprintf(g_current_tmpl.job_id, 32, "%x", ++job_counter);
     g_current_tmpl.clean_jobs = clean_jobs;
     
-    // 1. Height
     g_current_tmpl.height = json_integer_value(json_object_get(res, "height"));
     
-    // 2. Version (使用 RPC 的 Raw Hex)
+    // Version: 使用 Raw Hex
     const char *ver_hex = json_string_value(json_object_get(res, "versionHex"));
     strncpy(g_current_tmpl.version, ver_hex, 8);
     g_current_tmpl.version_int = json_integer_value(json_object_get(res, "version"));
     
-    // 3. Bits
+    // Bits: 使用 Raw Hex
     const char *bits = json_string_value(json_object_get(res, "bits"));
     strncpy(g_current_tmpl.nbits, bits, 8);
     g_current_tmpl.nbits_int = strtoul(bits, NULL, 16);
     
-    // 4. Time
+    // Time
     g_current_tmpl.ntime_int = json_integer_value(json_object_get(res, "curtime"));
     sprintf(g_current_tmpl.ntime, "%08x", swap_uint32(g_current_tmpl.ntime_int));
     
-    // 5. PrevHash (RPC BigEndian -> Stratum LittleEndian 32-byte Swap)
+    // PrevHash: 关键修复 - RPC BE -> Stratum LE (Reverse)
     const char *prev = json_string_value(json_object_get(res, "previousblockhash"));
     uint8_t prev_bin[32];
     hex2bin(prev, prev_bin, 32);
-    reverse_bytes(prev_bin, 32); // 完全反转
+    reverse_bytes(prev_bin, 32); 
     bin2hex(prev_bin, 32, g_current_tmpl.prev_hash);
     
     // Coinbase
@@ -279,13 +420,10 @@ void bitcoin_update_template(bool clean_jobs) {
     json_t *txs = json_object_get(res, "transactions");
     calculate_merkle_branch(txs, &g_current_tmpl);
     
-    log_info("New Job #%s [Height: %d] [Txs: %d]", g_current_tmpl.job_id, g_current_tmpl.height, g_current_tmpl.tx_count);
+    log_info("New Job %s (H:%d, Tx:%d, Ver:%s)", g_current_tmpl.job_id, g_current_tmpl.height, g_current_tmpl.tx_count, g_current_tmpl.version);
     
     stratum_broadcast_job(&g_current_tmpl);
     
     pthread_mutex_unlock(&g_tmpl_lock);
     json_decref(resp);
 }
-
-// 提交区块、重构等逻辑请保留原样 (引用 utils.c 中的 encode_varint 和 submitblock 实现)
-// 务必包含 bitcoin_reconstruct_and_submit 的实现

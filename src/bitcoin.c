@@ -143,10 +143,11 @@ bool bitcoin_get_latest_job(Template *out) {
 // 声明 utils.c 中的函数
 void address_to_script(const char *addr, char *script_hex); 
 
-// 构建 Coinbase (最终修正版): 
-// 1. 强制使用 Version 1 (01000000)
-// 2. 使用 BIP34 动态高度编码
-// 3. Pool Tag 放置在 ExtraNonce 之前 (Coinb1)，修复工具显示异常
+// 构建 Coinbase
+// 1. Version 1 (01000000)
+// 2. Height First (BIP34)
+// 3. Tag Second
+// 4. ExtraNonce Push Third (Ends Coinb1)
 void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, char *c2, const char *default_witness) {
     int tag_len = strlen(msg);
     if(tag_len > 60) tag_len = 60; // 截断保护
@@ -186,7 +187,7 @@ void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, c
     }
     
     // --- Coinb1 ---
-    // Header - Version 1 (01000000)
+    // Header - 强制使用 Version 1 (01000000)
     sprintf(c1, "010000000100000000000000000000000000000000000000000000000000000000ffffffff");
     
     // Script Length (VarInt)
@@ -205,10 +206,12 @@ void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, c
     }
     
     // 3. ExtraNonce Push Op (Coinb1 结尾)
-    // 矿机会在后面追加 EN1 + EN2
+    // 这将生成操作码 (例如 0c)，表示接下来要推入12字节。
+    // 矿机会在收到 Coinb1 后，紧接着填入这12字节的 ExtraNonce。
     sprintf(c1 + strlen(c1), "%02x", en_total); 
     
     // --- Coinb2 ---
+    // Coinb2 紧随 ExtraNonce 之后，必须以 Sequence (ffffffff) 开头
     // 4. Sequence
     sprintf(c2, "ffffffff"); 
     
@@ -303,6 +306,7 @@ int bitcoin_validate_and_submit(const char *job_id, const char *full_extranonce,
     
     uint8_t head[80];
     
+    // 区块头 Version 使用 Version Rolling (BIP320)
     uint32_t ver = job->version_val;
     if (g_config.version_mask != 0) {
         ver = (ver & ~g_config.version_mask) | (version_bits & g_config.version_mask);

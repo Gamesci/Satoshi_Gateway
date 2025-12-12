@@ -1,5 +1,5 @@
 {
-  "rpc_host": "127.0.0.1:8332",
+  "rpc_url": "127.0.0.1:8332",
   "rpc_user": "user",
   "rpc_pass": "password",
   "zmq_pub_hashblock": "tcp://127.0.0.1:28332",

@@ -19,7 +19,6 @@ static pthread_mutex_t g_tmpl_lock = PTHREAD_MUTEX_INITIALIZER;
 
 // --- 辅助工具函数 ---
 
-// 32字节大端比较
 static int cmp256(const uint8_t *a, const uint8_t *b) {
     for (int i = 0; i < 32; i++) {
         if (a[i] < b[i]) return -1;
@@ -28,7 +27,6 @@ static int cmp256(const uint8_t *a, const uint8_t *b) {
     return 0;
 }
 
-// 将 nbits 转为 256位 Target (Big Endian)
 static void nbits_to_target(uint32_t nbits, uint8_t *target) {
     memset(target, 0, 32);
     int exponent = nbits >> 24;
@@ -50,7 +48,6 @@ static void nbits_to_target(uint32_t nbits, uint8_t *target) {
     }
 }
 
-// 区块备份到磁盘
 void backup_block_to_disk(const char *block_hex) {
     #ifdef _WIN32
         _mkdir("backup");
@@ -126,7 +123,6 @@ int bitcoin_init() {
 
 void bitcoin_free_job(Template *t) {
     if (t->valid && t->tx_hexs) {
-        // 修复：类型不匹配警告
         for (size_t i = 0; i < t->tx_count; i++) 
             if (t->tx_hexs[i]) free(t->tx_hexs[i]);
         free(t->tx_hexs); 
@@ -144,35 +140,64 @@ bool bitcoin_get_latest_job(Template *out) {
     return true;
 }
 
-// address_to_script defined in utils.h/utils.c
+void address_to_script(const char *addr, char *script_hex); 
 
+// 构建 Coinbase: 
 void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, char *c2, const char *default_witness) {
     int tag_len = strlen(msg);
-    if(tag_len > 60) tag_len = 60; // 强制截断保护
+    if(tag_len > 60) tag_len = 60; // 截断保护
     
     int en1_size = 4;
     int en2_size = g_config.extranonce2_size;
     int en_total = en1_size + en2_size;
     
-    int total_len = 4 + 1 + en_total + 1 + tag_len;
-    if (total_len > 100) { total_len = 100; tag_len = 100 - (4 + 1 + en_total + 1); }
+    // 计算 Tag Push Op 长度
+    int tag_push_len = (tag_len >= 76) ? 2 : 1;
+    if (tag_len == 0) tag_push_len = 0;
+
+    int total_len = 4 + 1 + en_total + 1 + tag_push_len + tag_len;
     
+    // BIP34 限制
+    if (total_len > 100) {
+        tag_len = 0;
+        tag_push_len = 0;
+        total_len = 4 + 1 + en_total + 1;
+    }
+    
+    // --- Coinb1 ---
+    // Header
     sprintf(c1, "010000000100000000000000000000000000000000000000000000000000000000ffffffff");
+    
+    // Script Length
     char len_hex[10]; sprintf(len_hex, "%02x", total_len); strcat(c1, len_hex);
     
+    // 1. BIP34 Height
     uint8_t h_le[4]; 
     h_le[0]=height&0xff; h_le[1]=(height>>8)&0xff; h_le[2]=(height>>16)&0xff; h_le[3]=(height>>24)&0xff;
     sprintf(c1 + strlen(c1), "03%02x%02x%02x", h_le[0], h_le[1], h_le[2]);
     
+    // 2. Pool Tag (移至 Coinb1)
+    if (tag_len > 0) {
+        if (tag_len >= 76) sprintf(c1 + strlen(c1), "4c%02x", tag_len);
+        else sprintf(c1 + strlen(c1), "%02x", tag_len);
+        
+        for(int i=0; i<tag_len; i++) sprintf(c1 + strlen(c1), "%02x", (unsigned char)msg[i]);
+    }
+
+    // 3. ExtraNonce Push Op (Coinb1 结尾)
+    // 矿机会在后面追加 EN1 + EN2
     sprintf(c1 + strlen(c1), "%02x", en_total); 
     
-    sprintf(c2, "%02x", tag_len); 
-    char tag_hex[128] = {0};
-    for(int i=0; i<tag_len; i++) sprintf(tag_hex + i*2, "%02x", (unsigned char)msg[i]);
-    strcat(c2, tag_hex);
+    // --- Coinb2 ---
+    // 4. Sequence (必须位于 Coinb2 开头，以便矿机识别)
+    sprintf(c2, "ffffffff"); 
     
-    strcat(c2, "ffffffff02"); 
-    
+    // Outputs
+    int output_count = (default_witness && strlen(default_witness) > 0) ? 2 : 1;
+    char out_cnt_hex[4]; sprintf(out_cnt_hex, "%02x", output_count);
+    strcat(c2, out_cnt_hex);
+
+    // Payout
     char val_hex[17]; sprintf(val_hex, "%016lx", value);
     uint8_t val_bin[8]; hex2bin(val_hex, val_bin, 8); reverse_bytes(val_bin, 8);
     char val_le[17]; bin2hex(val_bin, 8, val_le); strcat(c2, val_le);
@@ -183,13 +208,14 @@ void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, c
     char sl_hex[10]; sprintf(sl_hex, "%02x", (int)strlen(script_pub)/2);
     strcat(c2, sl_hex); strcat(c2, script_pub);
 
-    strcat(c2, "0000000000000000"); 
-    if (default_witness && strlen(default_witness) > 0) {
+    // Witness
+    if (output_count > 1) {
+        strcat(c2, "0000000000000000"); 
         char w_len_hex[10]; sprintf(w_len_hex, "%02x", (int)strlen(default_witness)/2);
         strcat(c2, w_len_hex); strcat(c2, default_witness);
-    } else {
-        strcat(c2, "266a24aa21a9ed0000000000000000000000000000000000000000000000000000000000000000");
     }
+    
+    // Locktime
     strcat(c2, "00000000");
 }
 
@@ -205,8 +231,6 @@ void calculate_merkle_branch(json_t *txs, Template *tmpl) {
         if(!tid || !dat) { tmpl->tx_hexs[i] = strdup(""); memset(leaves[i+1], 0, 32); continue; }
         
         tmpl->tx_hexs[i] = strdup(dat);
-        
-        // Merkle Branch LE
         hex2bin(tid, leaves[i+1], 32); 
     }
     
@@ -250,7 +274,6 @@ int bitcoin_validate_and_submit(const char *job_id, const char *full_extranonce,
     }
     if (!job) { pthread_mutex_unlock(&g_tmpl_lock); log_info("Stale: Job %s not found.", job_id); return 0; }
 
-    // 修复：size_t 警告
     size_t sz = 80 + 4096; 
     for(size_t i=0; i<job->tx_count; i++) sz += strlen(job->tx_hexs[i]);
     
@@ -302,7 +325,6 @@ int bitcoin_validate_and_submit(const char *job_id, const char *full_extranonce,
         bin2hex(vi, vl, p); p += vl * 2;
         strcpy(p, coin); p += strlen(coin);
         
-        // 修复：size_t 警告
         for(size_t i=0; i<job->tx_count; i++) { 
             strcpy(p, job->tx_hexs[i]); 
             p += strlen(job->tx_hexs[i]); 
@@ -372,7 +394,7 @@ void bitcoin_update_template(bool force_clean) {
     if(txs) calculate_merkle_branch(txs, curr); else curr->merkle_count = 0;
     
     log_info("Job %s [H:%d Tx:%d] Clean:%d", curr->job_id, curr->height, curr->tx_count, clean);
-    stratum_broadcast_job(curr); // 修复：已在 stratum.h 声明
+    stratum_broadcast_job(curr);
     
     pthread_mutex_unlock(&g_tmpl_lock);
     json_decref(resp);

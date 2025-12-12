@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-// 日志函数声明
+// 日志系统
 void log_info(const char *format, ...);
 void log_error(const char *format, ...);
 void log_debug(const char *format, ...);
@@ -15,7 +15,7 @@ void bin2hex(const uint8_t *bin, size_t bin_len, char *hex);
 void reverse_bytes(uint8_t *buf, size_t len);
 uint32_t swap_uint32(uint32_t val);
 
-// 地址解码 (保留之前的声明)
+// 地址解码支持
 int base58_decode_check(const char *str, uint8_t *payload, size_t *payload_len);
 int segwit_addr_decode(int* witver, uint8_t* witprog, size_t* witprog_len, const char* hrp, const char* addr);
 

@@ -11,12 +11,15 @@
 #include "utils.h"
 #include "sha256.h"
 
-static Template g_current_tmpl = {0};
+// --- 任务历史环形缓冲 ---
+static Template g_jobs[MAX_JOB_HISTORY];
+static int g_job_head = 0; // 指向当前最新任务
 static pthread_mutex_t g_tmpl_lock = PTHREAD_MUTEX_INITIALIZER;
 
 // 前置声明
 void address_to_script(const char *addr, char *script_hex);
 
+// --- CURL 辅助 ---
 struct MemoryStruct { char *memory; size_t size; };
 static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp) {
     size_t realsize = size * nmemb;
@@ -82,42 +85,46 @@ static json_t* rpc_call(const char *method, json_t *params) {
 }
 
 int bitcoin_init() {
+    // 初始化任务槽
+    for(int i=0; i<MAX_JOB_HISTORY; i++) {
+        g_jobs[i].valid = false;
+        g_jobs[i].tx_hexs = NULL;
+        g_jobs[i].tx_count = 0;
+    }
     return curl_global_init(CURL_GLOBAL_ALL);
 }
 
-void bitcoin_cleanup_template(Template *t) {
-    if (t->tx_hexs) {
+void bitcoin_free_job(Template *t) {
+    if (t->valid && t->tx_hexs) {
         for (int i = 0; i < t->tx_count; i++) {
             if (t->tx_hexs[i]) free(t->tx_hexs[i]);
         }
         free(t->tx_hexs);
         t->tx_hexs = NULL;
     }
+    t->valid = false;
     t->tx_count = 0;
 }
 
-bool bitcoin_get_current_job_copy(Template *out) {
+// 获取最新任务副本（线程安全）
+bool bitcoin_get_latest_job(Template *out) {
     pthread_mutex_lock(&g_tmpl_lock);
-    if (strlen(g_current_tmpl.job_id) == 0) {
+    Template *curr = &g_jobs[g_job_head];
+    
+    if (!curr->valid) {
         pthread_mutex_unlock(&g_tmpl_lock);
         return false;
     }
-    strcpy(out->job_id, g_current_tmpl.job_id);
-    strcpy(out->prev_hash, g_current_tmpl.prev_hash);
-    strcpy(out->coinb1, g_current_tmpl.coinb1);
-    strcpy(out->coinb2, g_current_tmpl.coinb2);
-    strcpy(out->version, g_current_tmpl.version);
-    strcpy(out->nbits, g_current_tmpl.nbits);
-    strcpy(out->ntime, g_current_tmpl.ntime);
-    out->height = g_current_tmpl.height;
-    out->clean_jobs = false;
-    out->merkle_count = g_current_tmpl.merkle_count;
-    for(int i=0; i<out->merkle_count; i++) {
-        strcpy(out->merkle_branch[i], g_current_tmpl.merkle_branch[i]);
-    }
+    
+    *out = *curr; // 结构体拷贝
+    // 注意：tx_hexs 只是浅拷贝指针，但在 Stratum 发送任务时不需要用到 tx_hexs 的内容
+    // 只要不去释放它就是安全的。
+    
     pthread_mutex_unlock(&g_tmpl_lock);
     return true;
 }
+
+// --- 核心工具函数 ---
 
 void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, char *c2, const char *default_witness) {
     sprintf(c1, "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff");
@@ -227,6 +234,7 @@ int bitcoin_submit_block(const char *hex_data) {
         if(json_is_null(res)) {
             success = 1;
         } else {
+            // 这里会打印具体的错误原因 (high-hash, bad-txns等)
             log_error("Submit Block Rejected: %s", json_string_value(res));
         }
         json_decref(resp);
@@ -236,33 +244,47 @@ int bitcoin_submit_block(const char *hex_data) {
     return success;
 }
 
-int bitcoin_reconstruct_and_submit(const char *job_id, const char *full_extranonce, const char *ntime, uint32_t nonce, uint32_t version_mask) {
+// --- 验证 Share 的核心逻辑 (支持历史任务查找) ---
+int bitcoin_validate_and_submit(const char *job_id, const char *full_extranonce, const char *ntime, uint32_t nonce, uint32_t version_mask) {
     pthread_mutex_lock(&g_tmpl_lock);
     
-    if (strcmp(job_id, g_current_tmpl.job_id) != 0) {
+    // 1. 在历史记录中查找 Job
+    Template *target_job = NULL;
+    for(int i=0; i<MAX_JOB_HISTORY; i++) {
+        if(g_jobs[i].valid && strcmp(g_jobs[i].job_id, job_id) == 0) {
+            target_job = &g_jobs[i];
+            break;
+        }
+    }
+    
+    if (!target_job) {
         pthread_mutex_unlock(&g_tmpl_lock);
-        return 0; 
+        log_info("Stale Share: Job %s not found in history.", job_id);
+        return 0; // 无效任务
     }
 
+    // 2. 重构 Coinbase
     char coinbase_hex[8192];
-    sprintf(coinbase_hex, "%s%s%s", g_current_tmpl.coinb1, full_extranonce, g_current_tmpl.coinb2);
+    sprintf(coinbase_hex, "%s%s%s", target_job->coinb1, full_extranonce, target_job->coinb2);
     
-    size_t total_size = 80 + 2048 + 2048; 
-    for(int i=0; i<g_current_tmpl.tx_count; i++) total_size += strlen(g_current_tmpl.tx_hexs[i]);
+    // 3. 准备 Block 缓冲区
+    size_t total_size = 80 + 4096; 
+    for(int i=0; i<target_job->tx_count; i++) total_size += strlen(target_job->tx_hexs[i]);
     char *block_hex = malloc(total_size * 2);
     char *p = block_hex;
     
+    // 4. 重构 Block Header
     uint8_t header[80];
-    uint32_t ver = (version_mask != 0) ? version_mask : g_current_tmpl.version_int;
+    
+    // Version (LE)
+    uint32_t ver = (version_mask != 0) ? version_mask : target_job->version_val;
     *(uint32_t*)(header) = ver; 
     
-    // PrevHash Reconstruct:
-    // Stratum (Word Swapped) -> Swap32 -> Little Endian (Header Format)
-    uint8_t prev_bin[32];
-    hex2bin(g_current_tmpl.prev_hash, prev_bin, 32);
-    swap32_buffer(prev_bin, 32); // 还原为 LE
-    memcpy(header+4, prev_bin, 32);
+    // PrevHash (LE)
+    // 直接使用内部存储的 BIN，已经是 Little Endian
+    memcpy(header+4, target_job->prev_hash_bin, 32);
     
+    // Merkle Root calculation
     uint8_t coinbase_bin[4096];
     size_t cb_len = strlen(coinbase_hex) / 2;
     hex2bin(coinbase_hex, coinbase_bin, cb_len);
@@ -270,9 +292,9 @@ int bitcoin_reconstruct_and_submit(const char *job_id, const char *full_extranon
     uint8_t current_hash[32];
     sha256_double(coinbase_bin, cb_len, current_hash);
     
-    for (int i=0; i<g_current_tmpl.merkle_count; i++) {
+    for (int i=0; i<target_job->merkle_count; i++) {
         uint8_t branch_bin[32];
-        hex2bin(g_current_tmpl.merkle_branch[i], branch_bin, 32);
+        hex2bin(target_job->merkle_branch[i], branch_bin, 32);
         uint8_t concat[64];
         memcpy(concat, current_hash, 32);
         memcpy(concat+32, branch_bin, 32);
@@ -280,31 +302,54 @@ int bitcoin_reconstruct_and_submit(const char *job_id, const char *full_extranon
     }
     memcpy(header+36, current_hash, 32);
     
+    // Time & Bits & Nonce (LE)
     uint32_t t_val = strtoul(ntime, NULL, 16);
     *(uint32_t*)(header+68) = t_val; 
-    *(uint32_t*)(header+72) = g_current_tmpl.nbits_int;
+    *(uint32_t*)(header+72) = target_job->nbits_val;
     *(uint32_t*)(header+76) = nonce; 
     
-    bin2hex(header, 80, p); p += 160;
+    // 5. 本地 Hash 检查 (防止垃圾提交)
+    uint8_t block_hash[32];
+    sha256_double(header, 80, block_hash);
+    reverse_bytes(block_hash, 32); // 转为 BE 用于打印和观察
+    char hash_hex[65];
+    bin2hex(block_hash, 32, hash_hex);
     
-    uint8_t vi[9];
-    int vi_len = encode_varint(vi, 1 + g_current_tmpl.tx_count);
-    bin2hex(vi, vi_len, p); p += (vi_len * 2);
+    // 简单检查前导零，Bitaxe 算力低，通常不会满足全网难度
+    // 但为了逻辑完整，如果发现极低 Hash，则提交
+    int zeros = 0;
+    while(hash_hex[zeros] == '0') zeros++;
     
-    strcpy(p, coinbase_hex); p += strlen(coinbase_hex);
-    for(int i=0; i<g_current_tmpl.tx_count; i++) {
-        strcpy(p, g_current_tmpl.tx_hexs[i]);
-        p += strlen(g_current_tmpl.tx_hexs[i]);
+    int result = 1; // 默认视为低难度有效 Share
+    
+    // 如果 Hash 足够低 (例如前 12 位都是 0)，尝试提交给网络
+    if (zeros >= 12) {
+        log_info("High Diff Share found! Hash: %s", hash_hex);
+        
+        // 构建完整 Block
+        bin2hex(header, 80, p); p += 160;
+        uint8_t vi[9]; int vi_len = encode_varint(vi, 1 + target_job->tx_count);
+        bin2hex(vi, vi_len, p); p += (vi_len * 2);
+        strcpy(p, coinbase_hex); p += strlen(coinbase_hex);
+        for(int i=0; i<target_job->tx_count; i++) {
+            strcpy(p, target_job->tx_hexs[i]);
+            p += strlen(target_job->tx_hexs[i]);
+        }
+        
+        if (bitcoin_submit_block(block_hex)) {
+            result = 2; // Block Found!
+        }
     }
     
-    int ret = bitcoin_submit_block(block_hex);
     free(block_hex);
     pthread_mutex_unlock(&g_tmpl_lock);
-    return ret;
+    return result;
 }
 
-void bitcoin_update_template(bool clean_jobs) {
-    log_info("Fetching Block Template...");
+// -------------------------------------------------------------------
+// 核心逻辑: GBT 解析与多任务管理
+// -------------------------------------------------------------------
+void bitcoin_update_template(bool force_clean) {
     json_t *rules = json_array();
     json_array_append_new(rules, json_string("segwit"));
     json_array_append_new(rules, json_string("csv")); 
@@ -314,7 +359,6 @@ void bitcoin_update_template(bool clean_jobs) {
     json_array_append_new(params, args);
     
     json_t *resp = rpc_call("getblocktemplate", params);
-    
     if(!resp) {
         log_error("RPC Call returned NULL.");
         return;
@@ -336,58 +380,85 @@ void bitcoin_update_template(bool clean_jobs) {
     }
     
     pthread_mutex_lock(&g_tmpl_lock);
-    bitcoin_cleanup_template(&g_current_tmpl);
+    
+    // --- 判断是否需要 Clean Jobs ---
+    const char *new_prev = json_string_value(json_object_get(res, "previousblockhash"));
+    
+    bool clean_jobs = force_clean;
+    Template *last_job = &g_jobs[g_job_head];
+    
+    // 将 RPC 的 BE Hex 转为 LE Bin 以便比较
+    uint8_t new_prev_bin[32];
+    if (new_prev) {
+        hex2bin(new_prev, new_prev_bin, 32);
+        reverse_bytes(new_prev_bin, 32);
+    } else {
+        memset(new_prev_bin, 0, 32);
+    }
+    
+    // 如果上一个任务有效，且 PrevHash 变了，说明链高度变了，必须强制 Clean
+    if (last_job->valid) {
+        if (memcmp(last_job->prev_hash_bin, new_prev_bin, 32) != 0) {
+            clean_jobs = true; 
+            log_info("New Block Detected! Forcing Clean Jobs.");
+        }
+    }
+
+    // --- 移动指针，使用新槽位 ---
+    g_job_head = (g_job_head + 1) % MAX_JOB_HISTORY;
+    Template *curr = &g_jobs[g_job_head];
+    
+    // 释放覆盖掉的旧任务内存
+    bitcoin_free_job(curr);
     
     static int job_counter = 0;
-    snprintf(g_current_tmpl.job_id, 32, "%x", ++job_counter);
-    g_current_tmpl.clean_jobs = clean_jobs;
+    snprintf(curr->job_id, 32, "%x", ++job_counter);
+    curr->valid = true;
+    curr->clean_jobs = clean_jobs;
     
-    g_current_tmpl.height = json_integer_value(json_object_get(res, "height"));
+    // --- 填充数据 ---
+    curr->height = json_integer_value(json_object_get(res, "height"));
     
-    // Version: 优先使用 versionHex，缺失则回退到 version int
-    json_t *j_ver_hex = json_object_get(res, "versionHex");
-    g_current_tmpl.version_int = json_integer_value(json_object_get(res, "version"));
+    // 1. Version
+    curr->version_val = json_integer_value(json_object_get(res, "version"));
+    json_t *j_ver = json_object_get(res, "versionHex");
+    if(j_ver) strncpy(curr->version_hex, json_string_value(j_ver), 8);
+    else sprintf(curr->version_hex, "%08x", curr->version_val);
     
-    if (j_ver_hex) {
-        const char *ver_hex = json_string_value(j_ver_hex);
-        strncpy(g_current_tmpl.version, ver_hex, 8);
-    } else {
-        sprintf(g_current_tmpl.version, "%08x", g_current_tmpl.version_int);
-    }
+    // 2. PrevHash (保存 LE Bin 和 Stratum Hex)
+    memcpy(curr->prev_hash_bin, new_prev_bin, 32);
     
+    uint8_t swap_buf[32];
+    memcpy(swap_buf, curr->prev_hash_bin, 32);
+    swap32_buffer(swap_buf, 32); // 4字节字反转
+    bin2hex(swap_buf, 32, curr->prev_hash_stratum);
+    
+    // 3. Bits
     const char *bits = json_string_value(json_object_get(res, "bits"));
-    if(bits) strncpy(g_current_tmpl.nbits, bits, 8);
-    else strcpy(g_current_tmpl.nbits, "1d00ffff");
-    g_current_tmpl.nbits_int = strtoul(g_current_tmpl.nbits, NULL, 16);
+    if(bits) strncpy(curr->nbits_hex, bits, 8);
+    else strcpy(curr->nbits_hex, "1d00ffff");
+    curr->nbits_val = strtoul(curr->nbits_hex, NULL, 16);
     
-    g_current_tmpl.ntime_int = json_integer_value(json_object_get(res, "curtime"));
-    sprintf(g_current_tmpl.ntime, "%08x", g_current_tmpl.ntime_int);
+    // 4. Time
+    curr->curtime_val = json_integer_value(json_object_get(res, "curtime"));
+    sprintf(curr->ntime_hex, "%08x", curr->curtime_val);
     
-    // PrevHash: RPC(BE) -> Reverse -> Swap32
-    const char *prev = json_string_value(json_object_get(res, "previousblockhash"));
-    if(prev) {
-        uint8_t prev_bin[32];
-        hex2bin(prev, prev_bin, 32);
-        reverse_bytes(prev_bin, 32); // To Little Endian
-        swap32_buffer(prev_bin, 32); // To Stratum Words
-        bin2hex(prev_bin, 32, g_current_tmpl.prev_hash);
-    } else {
-        log_error("PrevHash missing! Check Node.");
-        memset(g_current_tmpl.prev_hash, '0', 64);
-    }
-    
+    // 5. Coinbase
     int64_t coin_val = json_integer_value(json_object_get(res, "coinbasevalue"));
     const char *def_wit = json_string_value(json_object_get(res, "default_witness_commitment"));
-    build_coinbase(g_current_tmpl.height, coin_val, g_config.coinbase_tag, 
-                   g_current_tmpl.coinb1, g_current_tmpl.coinb2, def_wit);
+    build_coinbase(curr->height, coin_val, g_config.coinbase_tag, 
+                   curr->coinb1, curr->coinb2, def_wit);
     
+    // 6. Merkle
     json_t *txs = json_object_get(res, "transactions");
-    if(txs) calculate_merkle_branch(txs, &g_current_tmpl);
-    else g_current_tmpl.merkle_count = 0;
+    if(txs) calculate_merkle_branch(txs, curr);
+    else curr->merkle_count = 0;
     
-    log_info("New Job #%s Height:%d Txs:%d Ver:%s", g_current_tmpl.job_id, g_current_tmpl.height, g_current_tmpl.tx_count, g_current_tmpl.version);
+    log_info("Job %s: H=%d Txs=%d Clean=%d Ver=%s Time=%s", 
+             curr->job_id, curr->height, curr->tx_count, clean_jobs,
+             curr->version_hex, curr->ntime_hex);
     
-    stratum_broadcast_job(&g_current_tmpl);
+    stratum_broadcast_job(curr);
     
     pthread_mutex_unlock(&g_tmpl_lock);
     json_decref(resp);

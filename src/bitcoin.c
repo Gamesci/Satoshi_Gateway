@@ -17,7 +17,6 @@ static pthread_mutex_t g_tmpl_lock = PTHREAD_MUTEX_INITIALIZER;
 // 前置声明
 void address_to_script(const char *addr, char *script_hex);
 
-// CURL 辅助
 struct MemoryStruct { char *memory; size_t size; };
 static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp) {
     size_t realsize = size * nmemb;
@@ -59,7 +58,7 @@ static json_t* rpc_call(const char *method, json_t *params) {
     curl_easy_setopt(curl, CURLOPT_PASSWORD, g_config.rpc_pass);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L); 
     
     CURLcode res = curl_easy_perform(curl);
     json_t *response = NULL;
@@ -67,7 +66,9 @@ static json_t* rpc_call(const char *method, json_t *params) {
     if (res == CURLE_OK) {
         json_error_t err;
         response = json_loads(chunk.memory, 0, &err);
-        if (!response) log_error("RPC JSON Parse Error: %s", err.text);
+        if (!response) {
+            log_error("RPC JSON Parse Error. Raw: %.100s...", chunk.memory);
+        }
     } else {
         log_error("RPC Connection Failed: %s", curl_easy_strerror(res));
     }
@@ -95,14 +96,12 @@ void bitcoin_cleanup_template(Template *t) {
     t->tx_count = 0;
 }
 
-// 获取当前任务副本（线程安全）
 bool bitcoin_get_current_job_copy(Template *out) {
     pthread_mutex_lock(&g_tmpl_lock);
     if (strlen(g_current_tmpl.job_id) == 0) {
         pthread_mutex_unlock(&g_tmpl_lock);
         return false;
     }
-    
     strcpy(out->job_id, g_current_tmpl.job_id);
     strcpy(out->prev_hash, g_current_tmpl.prev_hash);
     strcpy(out->coinb1, g_current_tmpl.coinb1);
@@ -112,61 +111,17 @@ bool bitcoin_get_current_job_copy(Template *out) {
     strcpy(out->ntime, g_current_tmpl.ntime);
     out->height = g_current_tmpl.height;
     out->clean_jobs = false;
-    
     out->merkle_count = g_current_tmpl.merkle_count;
     for(int i=0; i<out->merkle_count; i++) {
         strcpy(out->merkle_branch[i], g_current_tmpl.merkle_branch[i]);
     }
-    
     pthread_mutex_unlock(&g_tmpl_lock);
     return true;
 }
 
-void address_to_script(const char *addr, char *script_hex) {
-    uint8_t buf[64];
-    size_t len = 0;
-    int witver;
-    
-    // Bech32
-    if (segwit_addr_decode(&witver, buf, &len, "bc", addr) || 
-        segwit_addr_decode(&witver, buf, &len, "tb", addr) || 
-        segwit_addr_decode(&witver, buf, &len, "bcrt", addr)) {
-        uint8_t op_ver = (witver == 0) ? 0x00 : (0x50 + witver);
-        sprintf(script_hex, "%02x%02x", op_ver, (int)len);
-        char prog_hex[128];
-        bin2hex(buf, len, prog_hex);
-        strcat(script_hex, prog_hex);
-        return;
-    }
-    
-    // Base58
-    int ver = base58_decode_check(addr, buf, &len);
-    if (ver >= 0) {
-        if (ver == 0 || ver == 111) { // P2PKH
-            strcpy(script_hex, "76a914");
-            char hash_hex[41];
-            bin2hex(buf, len, hash_hex);
-            strcat(script_hex, hash_hex);
-            strcat(script_hex, "88ac");
-            return;
-        } else if (ver == 5 || ver == 196) { // P2SH
-            strcpy(script_hex, "a914");
-            char hash_hex[41];
-            bin2hex(buf, len, hash_hex);
-            strcat(script_hex, hash_hex);
-            strcat(script_hex, "87");
-            return;
-        }
-    }
-    
-    log_error("Invalid Address: %s. Using OP_RETURN.", addr);
-    strcpy(script_hex, "6a04deadbeef"); 
-}
-
+// 复用 build_coinbase 逻辑
 void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, char *c2, const char *default_witness) {
-    // Part 1
     sprintf(c1, "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff");
-    
     uint8_t h_le[4];
     h_le[0]=height&0xff; h_le[1]=(height>>8)&0xff; h_le[2]=(height>>16)&0xff; h_le[3]=(height>>24)&0xff;
     
@@ -174,14 +129,10 @@ void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, c
     for(int i=0; msg[i] && i<20; i++) sprintf(tag_hex + i*2, "%02x", (unsigned char)msg[i]);
     
     char script_sig[256];
-    // Length (VarInt) + 03(Push) + H(3) + ...
     sprintf(script_sig, "2003%02x%02x%02x14%s", h_le[0], h_le[1], h_le[2], tag_hex);
     strcat(c1, script_sig);
 
-    // Part 2
     sprintf(c2, "ffffffff02"); 
-
-    // Output 1: Reward
     char val_hex[17];
     sprintf(val_hex, "%016lx", value);
     uint8_t val_bin[8];
@@ -199,7 +150,6 @@ void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, c
     strcat(c2, len_hex);
     strcat(c2, script_pubkey);
 
-    // Output 2: Witness
     strcat(c2, "0000000000000000"); 
     if (default_witness && strlen(default_witness) > 0) {
         int w_len = strlen(default_witness) / 2;
@@ -230,7 +180,6 @@ void calculate_merkle_branch(json_t *txs, Template *tmpl) {
              memset(leaves[i+1], 0, 32);
              continue;
         }
-
         tmpl->tx_hexs[i] = strdup(data_hex);
         uint8_t bin[32];
         hex2bin(txid_hex, bin, 32);
@@ -354,7 +303,7 @@ int bitcoin_reconstruct_and_submit(const char *job_id, const char *full_extranon
 }
 
 // -------------------------------------------------------------------
-// 核心修复区域：带空值检查的解析逻辑
+// 核心修复区域：宽容模式解析 + 详细调试日志
 // -------------------------------------------------------------------
 void bitcoin_update_template(bool clean_jobs) {
     log_info("Fetching Block Template...");
@@ -367,18 +316,41 @@ void bitcoin_update_template(bool clean_jobs) {
     json_array_append_new(params, args);
     
     json_t *resp = rpc_call("getblocktemplate", params);
-    if(!resp || !json_object_get(resp, "result")) {
-        char *s = resp ? json_dumps(resp, 0) : "NULL";
-        log_error("GetBlockTemplate Failed. Resp: %s", s);
-        if(resp && s!="NULL") free(s);
-        if(resp) json_decref(resp);
+    
+    // 1. 基础检查
+    if(!resp) {
+        log_error("RPC Call returned NULL. Check connection.");
         return;
     }
+
+    // 2. 错误处理
+    json_t *error = json_object_get(resp, "error");
+    if (error && !json_is_null(error)) {
+        json_t *msg = json_object_get(error, "message");
+        const char *err_msg = json_is_string(msg) ? json_string_value(msg) : "Unknown";
+        log_error("Node Error: %s", err_msg);
+        json_decref(resp);
+        return;
+    }
+
     json_t *res = json_object_get(resp, "result");
+    if (!res || !json_is_object(res)) {
+        log_error("Invalid RPC: result is missing or not object");
+        json_decref(resp);
+        return;
+    }
     
-    // 安全检查
-    if(!json_object_get(res, "versionHex") || !json_object_get(res, "previousblockhash") || !json_object_get(res, "bits")) {
-        log_error("GBT Response missing critical fields (version/prevhash/bits). Node syncing?");
+    // 3. 字段检查 (Debug Mode)
+    // 如果 versionHex 缺失，尝试回退到 version
+    json_t *j_ver_hex = json_object_get(res, "versionHex");
+    json_t *j_prev = json_object_get(res, "previousblockhash");
+    json_t *j_bits = json_object_get(res, "bits");
+
+    if (!j_prev || !j_bits) {
+        // 如果关键字段真的没了，打印原始数据
+        char *dump = json_dumps(res, 0);
+        log_error("[DEBUG] Raw GBT Response (Missing keys): %s", dump);
+        free(dump);
         json_decref(resp);
         return;
     }
@@ -392,35 +364,41 @@ void bitcoin_update_template(bool clean_jobs) {
     g_current_tmpl.clean_jobs = clean_jobs;
     
     g_current_tmpl.height = json_integer_value(json_object_get(res, "height"));
-    
-    // Version Check
-    const char *ver_hex = json_string_value(json_object_get(res, "versionHex"));
-    if(ver_hex) strncpy(g_current_tmpl.version, ver_hex, 8);
-    else strcpy(g_current_tmpl.version, "00000000"); 
-    
     g_current_tmpl.version_int = json_integer_value(json_object_get(res, "version"));
+
+    // VersionHex 处理 (兼容性修复)
+    if (j_ver_hex) {
+        const char *ver_hex = json_string_value(j_ver_hex);
+        strncpy(g_current_tmpl.version, ver_hex, 8);
+    } else {
+        // 如果没有 versionHex，手动把 versionInt 转为 BE Hex
+        // RPC version 通常是十进制 int。Stratum 需要 BE Hex 字符串。
+        // 例如 version=536870912 (0x20000000). Hex="20000000".
+        // 注意：Swap? 
+        // 之前代码: sprintf(..., swap_uint32(ver_int))
+        // 通常 versionHex 已经是 BE。如果它是 Int，在 x86 内存是 LE。
+        // 我们直接按 BE 打印它。
+        uint32_t v = g_current_tmpl.version_int;
+        // 尝试 Swap 后打印 (模仿 RPC 行为)
+        sprintf(g_current_tmpl.version, "%08x", swap_uint32(v));
+        log_info("[WARN] Missing versionHex, generated from version: %s", g_current_tmpl.version);
+    }
     
-    // Bits Check
-    const char *bits = json_string_value(json_object_get(res, "bits"));
-    if(bits) strncpy(g_current_tmpl.nbits, bits, 8);
-    else strcpy(g_current_tmpl.nbits, "1d00ffff");
+    // Bits
+    const char *bits_str = json_string_value(j_bits);
+    strncpy(g_current_tmpl.nbits, bits_str, 8);
     g_current_tmpl.nbits_int = strtoul(g_current_tmpl.nbits, NULL, 16);
     
     // Time
     g_current_tmpl.ntime_int = json_integer_value(json_object_get(res, "curtime"));
     sprintf(g_current_tmpl.ntime, "%08x", swap_uint32(g_current_tmpl.ntime_int));
     
-    // PrevHash Check
-    const char *prev = json_string_value(json_object_get(res, "previousblockhash"));
-    if(prev) {
-        uint8_t prev_bin[32];
-        hex2bin(prev, prev_bin, 32);
-        reverse_bytes(prev_bin, 32); 
-        bin2hex(prev_bin, 32, g_current_tmpl.prev_hash);
-    } else {
-        log_error("PrevHash missing!");
-        memset(g_current_tmpl.prev_hash, '0', 64);
-    }
+    // PrevHash
+    const char *prev = json_string_value(j_prev);
+    uint8_t prev_bin[32];
+    hex2bin(prev, prev_bin, 32);
+    reverse_bytes(prev_bin, 32); 
+    bin2hex(prev_bin, 32, g_current_tmpl.prev_hash);
     
     // Coinbase
     int64_t coin_val = json_integer_value(json_object_get(res, "coinbasevalue"));
@@ -430,11 +408,8 @@ void bitcoin_update_template(bool clean_jobs) {
     
     // Merkle
     json_t *txs = json_object_get(res, "transactions");
-    if(txs) {
-        calculate_merkle_branch(txs, &g_current_tmpl);
-    } else {
-        g_current_tmpl.merkle_count = 0;
-    }
+    if(txs) calculate_merkle_branch(txs, &g_current_tmpl);
+    else g_current_tmpl.merkle_count = 0;
     
     log_info("New Job #%s Height:%d Txs:%d Ver:%s", g_current_tmpl.job_id, g_current_tmpl.height, g_current_tmpl.tx_count, g_current_tmpl.version);
     

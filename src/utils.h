@@ -19,4 +19,7 @@ uint32_t swap_uint32(uint32_t val);
 int base58_decode_check(const char *str, uint8_t *payload, size_t *payload_len);
 int segwit_addr_decode(int* witver, uint8_t* witprog, size_t* witprog_len, const char* hrp, const char* addr);
 
+// 关键修复：在此处声明地址转换函数，供 bitcoin.c 调用
+void address_to_script(const char *addr, char *script_hex);
+
 #endif

@@ -11,7 +11,6 @@
 #include "utils.h"
 #include "sha256.h"
 
-// Task History Ring Buffer
 static Template g_jobs[MAX_JOB_HISTORY];
 static int g_job_head = 0;
 static pthread_mutex_t g_tmpl_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -84,14 +83,25 @@ bool bitcoin_get_latest_job(Template *out) {
     return true;
 }
 
-void address_to_script(const char *addr, char *script_hex); // Forward decl
+// 前置声明
+void address_to_script(const char *addr, char *script_hex);
 
+// 构建 Coinbase: 确保 tag_len 和 varint 正确
 void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, char *c2, const char *default_witness) {
     int tag_len = strlen(msg); if(tag_len > 32) tag_len = 32;
-    // ScriptSig = [Push Height] + [Push EN1] + [Push EN2] + [Push Tag]
     int en1_size = 4;
     int en2_size = g_config.extranonce2_size;
-    int total_len = 4 + (1+en1_size) + (1+en2_size) + (1+tag_len);
+    // Total ScriptSig Len = HeightPush(4) + EN1_Op(1)+EN1(4) + EN2_Op(1)+EN2(8) + Tag_Op(1)+TagLen
+    // 注意：Stratum 协议中，EN1 和 EN2 通常是直接拼接的数据，不带 Opcode。
+    // 但是为了生成合法的 ScriptSig，我们必须在这里把 Opcode 加上，或者预留位置。
+    // Public-Pool 的做法：c1 包含 height push。c2 包含 tag push。
+    // EN1 和 EN2 直接塞在中间。如果不加 Opcode，它们就是非法指令。
+    // 但大多数 ASIC 只是盲目拼接。
+    // 正确做法：c1 结尾加上 EN1+EN2 的 PUSH Opcode。
+    int en_total = en1_size + en2_size;
+    
+    // VarInt Length: Height(4) + PUSH_EN(1) + EN(12) + PUSH_TAG(1) + TAG(N)
+    int total_len = 4 + 1 + en_total + 1 + tag_len;
     
     sprintf(c1, "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff");
     char len_hex[10]; sprintf(len_hex, "%02x", total_len); strcat(c1, len_hex);
@@ -99,8 +109,8 @@ void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, c
     uint8_t h_le[4]; h_le[0]=height&0xff; h_le[1]=(height>>8)&0xff; h_le[2]=(height>>16)&0xff; h_le[3]=(height>>24)&0xff;
     sprintf(c1 + strlen(c1), "03%02x%02x%02x", h_le[0], h_le[1], h_le[2]);
     
-    int en_total = en1_size + en2_size;
-    sprintf(c1 + strlen(c1), "%02x", en_total); // PUSH Opcode for Extranonces
+    // 关键修正：添加 ExtraNonce 的 PUSH Opcode (例如 0c 表示推送 12 字节)
+    sprintf(c1 + strlen(c1), "%02x", en_total); 
     
     sprintf(c2, "%02x", tag_len); 
     char tag_hex[128] = {0};
@@ -140,7 +150,7 @@ void calculate_merkle_branch(json_t *txs, Template *tmpl) {
         
         tmpl->tx_hexs[i] = strdup(dat);
         
-        // CRITICAL FIX: Reverse TxID from RPC (LE) to Internal (BE) for Merkle Tree
+        // 关键修正：RPC 返回的 TxID 是 LE，Merkle Tree 需要 Internal Byte Order (BE)，必须反转！
         uint8_t b[32]; hex2bin(tid, b, 32); reverse_bytes(b, 32); 
         memcpy(leaves[i+1], b, 32);
     }
@@ -205,17 +215,14 @@ int bitcoin_validate_and_submit(const char *job_id, const char *full_extranonce,
     uint32_t tv = strtoul(ntime, NULL, 16); *(uint32_t*)(head+68) = tv; 
     *(uint32_t*)(head+72) = job->nbits_val; 
     
-    // FIX: Stratum Nonce is BE Hex string, Header needs LE integer.
-    // strtoul("aa..") gives int value. x86 writes LE.
-    // If input is "00000001", strtoul=1. Mem=01 00 00 00. Correct.
-    // BUT Bitaxe sends Big Endian nonce? No, Stratum usually sends BE hex string.
-    // Let's try swapping it to align with the hash result.
+    // 关键修正：Stratum Nonce 是 BE Hex String，Header 需要 LE Int。必须 Swap。
     *(uint32_t*)(head+76) = swap_uint32(nonce); 
     
     uint8_t h[32]; sha256_double(head, 80, h); reverse_bytes(h, 32);
     char hh[65]; bin2hex(h, 32, hh);
     
-    log_info("Miner Share Hash: %s", hh); // Debug log
+    log_info("Miner Share Hash: %s", hh); // 现在应该看到 000000... 开头了
+    fflush(stdout);
     
     int zeros = 0; while(hh[zeros] == '0') zeros++;
     int result = 1;

@@ -48,7 +48,7 @@ void client_remove(Client *c) {
         close(c->sock);
         c->active = false;
         c->sock = -1;
-        log_info("Client %d disconnected.", c->id);
+        log_info("Client %d Disconnected", c->id);
     }
     pthread_mutex_unlock(&g_clients_lock);
 }
@@ -67,7 +67,6 @@ void send_json(int sock, json_t *response) {
     }
 }
 
-// 辅助：发送单个任务
 void stratum_send_mining_notify(int sock, Template *tmpl) {
     json_t *params = json_array();
     json_array_append_new(params, json_string(tmpl->job_id));
@@ -104,7 +103,7 @@ void stratum_broadcast_job(Template *tmpl) {
         }
     }
     pthread_mutex_unlock(&g_clients_lock);
-    log_info("Broadcasted Job %s to %d workers", tmpl->job_id, c);
+    if(c > 0) log_info("Broadcast Job %s to %d miners", tmpl->job_id, c);
 }
 
 void *client_worker(void *arg) {
@@ -112,7 +111,7 @@ void *client_worker(void *arg) {
     char buffer[4096];
     int read_pos = 0;
 
-    log_info("Worker connected: ID=%d IP=%s", c->id, inet_ntoa(c->addr.sin_addr));
+    log_info("New Miner: ID=%d IP=%s", c->id, inet_ntoa(c->addr.sin_addr));
 
     struct timeval tv;
     tv.tv_sec = 600; 
@@ -140,7 +139,7 @@ void *client_worker(void *arg) {
                     
                     if(!method) { /* ignore */ }
                     else if(strcmp(method, "mining.subscribe") == 0) {
-                        log_info("ID=%d Subscribed", c->id);
+                        log_info("Miner %d Subscribed", c->id);
                         json_object_set_new(res, "error", json_null());
                         json_t *arr = json_array();
                         json_t *subs = json_array();
@@ -166,7 +165,8 @@ void *client_worker(void *arg) {
                         json_object_set_new(res, "error", json_null());
                         json_object_set_new(res, "result", json_true());
                         send_json(c->sock, res);
-                        log_info("ID=%d Authorized", c->id);
+                        
+                        log_info("Miner %d Authorized. Sending Job...", c->id);
                         
                         // 1. Send Diff
                         json_t *dreq = json_object();
@@ -178,11 +178,12 @@ void *client_worker(void *arg) {
                         send_json(c->sock, dreq);
                         json_decref(dreq);
                         
-                        // 2. 立即发送当前任务
+                        // 2. Immediate Job Dispatch
                         Template tmpl;
                         if(bitcoin_get_current_job_copy(&tmpl)) {
-                            log_info("Sending initial Job %s to ID=%d", tmpl.job_id, c->id);
                             stratum_send_mining_notify(c->sock, &tmpl);
+                        } else {
+                            log_info("No job available for Miner %d yet.", c->id);
                         }
                     }
                     else if(strcmp(method, "mining.configure") == 0) {
@@ -194,10 +195,31 @@ void *client_worker(void *arg) {
                          send_json(c->sock, res);
                     }
                     else if(strcmp(method, "mining.submit") == 0) {
-                        // (保留之前的 Submit 逻辑，调用 bitcoin_reconstruct_and_submit)
+                        json_t *params = json_object_get(req, "params");
+                        const char *job_id = json_string_value(json_array_get(params, 1));
+                        const char *en2 = json_string_value(json_array_get(params, 2));
+                        const char *ntime = json_string_value(json_array_get(params, 3));
+                        const char *nonce_hex = json_string_value(json_array_get(params, 4));
+                        
+                        uint32_t ver_mask = 0;
+                        if(json_array_size(params) >= 6) {
+                            const char *ver_hex = json_string_value(json_array_get(params, 5));
+                            if(ver_hex) ver_mask = strtoul(ver_hex, NULL, 16);
+                        }
+                        
+                        uint32_t nonce = (uint32_t)strtoul(nonce_hex, NULL, 16);
+                        log_info("Share! Miner %d, Job %s, Nonce %s", c->id, job_id, nonce_hex);
+                        
+                        char full_extra[64];
+                        snprintf(full_extra, sizeof(full_extra), "%s%s", c->extranonce1_hex, en2);
+                        
+                        int ret = bitcoin_reconstruct_and_submit(job_id, full_extra, ntime, nonce, ver_mask);
+                        
                         json_object_set_new(res, "error", json_null());
                         json_object_set_new(res, "result", json_true());
                         send_json(c->sock, res);
+                        
+                        if(ret) log_info(">>> BLOCK FOUND & SUBMITTED <<<");
                     }
                     
                     json_decref(res);
@@ -215,7 +237,50 @@ void *client_worker(void *arg) {
         }
     }
     
-    // 关键修复：移除 free(c)
+    // Crash Fix: Removed free(c)
     client_remove(c);
     return NULL;
+}
+
+void *server_thread(void *arg) {
+    (void)arg;
+    int server_fd;
+    struct sockaddr_in address;
+    int opt = 1;
+    
+    init_clients();
+
+    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) exit(EXIT_FAILURE);
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) exit(EXIT_FAILURE);
+    
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(g_config.stratum_port);
+    
+    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) exit(EXIT_FAILURE);
+    if (listen(server_fd, 10) < 0) exit(EXIT_FAILURE);
+    
+    log_info("Stratum Server Listening on port %d", g_config.stratum_port);
+    
+    while(1) {
+        struct sockaddr_in client_addr;
+        socklen_t addrlen = sizeof(client_addr);
+        int new_socket = accept(server_fd, (struct sockaddr *)&client_addr, &addrlen);
+        
+        if (new_socket >= 0) {
+            Client *c = client_add(new_socket, client_addr);
+            if(c) {
+                pthread_create(&c->thread_id, NULL, client_worker, c);
+                pthread_detach(c->thread_id);
+            } else {
+                close(new_socket);
+            }
+        }
+    }
+    return NULL;
+}
+
+int stratum_start_thread() {
+    pthread_t t;
+    return pthread_create(&t, NULL, server_thread, NULL);
 }

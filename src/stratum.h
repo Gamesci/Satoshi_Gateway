@@ -25,6 +25,7 @@ typedef struct {
 } Client;
 
 void stratum_send_mining_notify(int sock, Template *tmpl);
+void stratum_broadcast_job(Template *tmpl);
 int stratum_start_thread();
 
 #endif

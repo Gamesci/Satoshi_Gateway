@@ -4,7 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define MAX_JOB_HISTORY 16
+#define MAX_JOB_HISTORY 3
 
 typedef struct {
     char job_id[32];

@@ -5,16 +5,24 @@
 #include <stdbool.h>
 
 typedef struct {
-    char rpc_url[256];          // 拼接后的完整 URL (http://...)
+    // RPC
+    char rpc_url[256];
     char rpc_user[128];
     char rpc_pass[128];
-    char payout_addr[128];      // reward_address
-    char coinbase_tag[64];      // pool_tag
-    int stratum_port;           // listen_port
-    int poll_interval_sec;      // poll_interval
-    uint32_t initial_diff;      // diff_asic
-    int extranonce2_size;       
-    char version_mask[32];      // 默认为 "1fffe000"
+    
+    // Mining
+    char payout_addr[128];
+    char coinbase_tag[64];
+    
+    // Stratum
+    int stratum_port;
+    int poll_interval_sec;
+    
+    // Hardware / ASIC
+    uint32_t initial_diff;
+    int extranonce2_size;
+    uint32_t version_mask; // 用于 Version Rolling (ASICBoost)
+    
 } AppConfig;
 
 extern AppConfig g_config;

@@ -30,7 +30,7 @@ static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, voi
 
 static json_t* rpc_call(const char *method, json_t *params) {
     CURL *curl; struct MemoryStruct chunk = {0}; chunk.memory = malloc(1); chunk.size = 0;
-    curl = curl_easy_init(); if (!curl) return NULL;
+    curl = curl_easy_init(); if (!curl) { log_error("Init CURL Failed"); return NULL; }
     
     json_t *req = json_object();
     json_object_set_new(req, "jsonrpc", json_string("1.0"));
@@ -54,7 +54,7 @@ static json_t* rpc_call(const char *method, json_t *params) {
     json_t *response = NULL;
     if (res == CURLE_OK) {
         json_error_t err; response = json_loads(chunk.memory, 0, &err);
-        if (!response) log_error("JSON Parse Error. Raw: %.50s", chunk.memory);
+        if (!response) log_error("JSON Parse Error: %.50s", chunk.memory);
     } else log_error("RPC Fail: %s", curl_easy_strerror(res));
     
     free(post_data); free(chunk.memory); curl_slist_free_all(headers); curl_easy_cleanup(curl); json_decref(req);
@@ -87,6 +87,7 @@ void address_to_script(const char *addr, char *script_hex); // Forward decl
 
 void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, char *c2, const char *default_witness) {
     int tag_len = strlen(msg); if(tag_len > 32) tag_len = 32;
+    // ScriptSig = [Push Height] + [Push EN1] + [Push EN2] + [Push Tag]
     int en1_size = 4;
     int en2_size = g_config.extranonce2_size;
     int total_len = 4 + (1+en1_size) + (1+en2_size) + (1+tag_len);
@@ -98,7 +99,7 @@ void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, c
     sprintf(c1 + strlen(c1), "03%02x%02x%02x", h_le[0], h_le[1], h_le[2]);
     
     int en_total = en1_size + en2_size;
-    sprintf(c1 + strlen(c1), "%02x", en_total); 
+    sprintf(c1 + strlen(c1), "%02x", en_total); // PUSH Opcode for Extranonces
     
     sprintf(c2, "%02x", tag_len); 
     char tag_hex[128] = {0};
@@ -129,12 +130,19 @@ void calculate_merkle_branch(json_t *txs, Template *tmpl) {
     size_t count = json_array_size(txs); tmpl->tx_count = count;
     size_t total = count + 1; uint8_t (*leaves)[32] = malloc(total * 32);
     tmpl->tx_hexs = malloc(count * sizeof(char*));
+    
     for (size_t i = 0; i < count; i++) {
         json_t *tx = json_array_get(txs, i);
-        const char *tid = json_string_value(json_object_get(tx, "txid")); const char *dat = json_string_value(json_object_get(tx, "data"));
+        const char *tid = json_string_value(json_object_get(tx, "txid"));
+        const char *dat = json_string_value(json_object_get(tx, "data"));
         if(!tid || !dat) { tmpl->tx_hexs[i] = strdup(""); memset(leaves[i+1], 0, 32); continue; }
-        tmpl->tx_hexs[i] = strdup(dat); uint8_t b[32]; hex2bin(tid, b, 32); memcpy(leaves[i+1], b, 32);
+        tmpl->tx_hexs[i] = strdup(dat);
+        
+        // FIX: Reverse RPC TxID to get Internal Hash
+        uint8_t b[32]; hex2bin(tid, b, 32); reverse_bytes(b, 32); 
+        memcpy(leaves[i+1], b, 32);
     }
+    
     int level = total; int idx = 0;
     while (level > 1) {
         if (level > 1) { char h[65]; bin2hex(leaves[1], 32, h); strcpy(tmpl->merkle_branch[idx++], h); }
@@ -160,7 +168,7 @@ int bitcoin_submit_block(const char *hex_data) {
     if(resp) {
         json_t *res = json_object_get(resp, "result");
         if(json_is_null(res)) { success = 1; } 
-        else { log_error("Submit Rejected: %s", json_string_value(res)); }
+        else { log_error("Reject: %s", json_string_value(res)); }
         json_decref(resp);
     }
     return success;
@@ -180,8 +188,11 @@ int bitcoin_validate_and_submit(const char *job_id, const char *full_extranonce,
     char *block = malloc(sz * 2); char *p = block;
     
     uint8_t head[80];
-    uint32_t ver = (version_mask != 0) ? version_mask : job->version_val; *(uint32_t*)(head) = ver; 
+    uint32_t ver = (version_mask != 0) ? version_mask : job->version_val; 
+    *(uint32_t*)(head) = ver; 
+    
     memcpy(head+4, job->prev_hash_bin, 32);
+    
     uint8_t cbin[4096]; size_t clen = strlen(coin)/2; hex2bin(coin, cbin, clen);
     uint8_t root[32]; sha256_double(cbin, clen, root);
     for (int i=0; i<job->merkle_count; i++) {
@@ -189,20 +200,22 @@ int bitcoin_validate_and_submit(const char *job_id, const char *full_extranonce,
         uint8_t cat[64]; memcpy(cat, root, 32); memcpy(cat+32, br, 32); sha256_double(cat, 64, root);
     }
     memcpy(head+36, root, 32);
+    
     uint32_t tv = strtoul(ntime, NULL, 16); *(uint32_t*)(head+68) = tv; 
-    *(uint32_t*)(head+72) = job->nbits_val; *(uint32_t*)(head+76) = nonce; 
+    *(uint32_t*)(head+72) = job->nbits_val; 
+    
+    // FIX: Swap Nonce because Stratum sends Big Endian String
+    *(uint32_t*)(head+76) = swap_uint32(nonce); 
     
     uint8_t h[32]; sha256_double(head, 80, h); reverse_bytes(h, 32);
     char hh[65]; bin2hex(h, 32, hh);
     
-    // --- 强制日志输出 ---
-    log_info("Miner Share Hash: %s", hh);
-    fflush(stdout);
+    log_info("Miner Share Hash: %s", hh); // Should start with zeros
     
     int zeros = 0; while(hh[zeros] == '0') zeros++;
     int result = 1;
     
-    if (zeros >= 10) { 
+    if (zeros >= 12) { 
         log_info(">>> HIGH DIFF SHARE: %s", hh);
         bin2hex(head, 80, p); p += 160;
         uint8_t vi[9]; int vl = encode_varint(vi, 1 + job->tx_count);

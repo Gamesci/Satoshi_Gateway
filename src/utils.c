@@ -8,7 +8,7 @@
 #include <time.h>
 
 // --- 日志实现 ---
-void log_print(const char* level, const char* format, va_list args) {
+static void log_print(const char* level, const char* format, va_list args) {
     time_t now;
     time(&now);
     char buf[20];
@@ -17,7 +17,7 @@ void log_print(const char* level, const char* format, va_list args) {
     fprintf(stdout, "[%s] [%s] ", buf, level);
     vfprintf(stdout, format, args);
     fprintf(stdout, "\n");
-    fflush(stdout); // 确保 Docker 能立即抓取到日志
+    fflush(stdout);
 }
 
 void log_info(const char *format, ...) {
@@ -35,11 +35,11 @@ void log_error(const char *format, ...) {
 }
 
 void log_debug(const char *format, ...) {
-    // 可以通过宏控制是否输出 DEBUG
-    // va_list args;
-    // va_start(args, format);
-    // log_print("DEBUG", format, args);
-    // va_end(args);
+    // 默认开启调试日志以便排查问题
+    va_list args;
+    va_start(args, format);
+    log_print("DEBUG", format, args);
+    va_end(args);
 }
 
 // --- Hex 工具 ---
@@ -68,8 +68,9 @@ uint32_t swap_uint32(uint32_t val) {
            ((val >> 8) & 0xff00) | ((val << 24) & 0xff000000);
 }
 
-// --- Base58 实现 (精简版) ---
+// --- Base58 实现 ---
 static const char *b58digits_map = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
 int base58_decode_check(const char *str, uint8_t *payload, size_t *payload_len) {
     uint8_t bin[128]; 
     size_t bin_len = 0;
@@ -97,7 +98,7 @@ int base58_decode_check(const char *str, uint8_t *payload, size_t *payload_len) 
         memset(payload, 0, zeros);
         memcpy(payload + zeros, bin + i, bin_len - zeros);
     }
-    // Verify Checksum
+    
     uint8_t hash[32];
     sha256_double(payload, bin_len - 4, hash);
     if (memcmp(hash, payload + bin_len - 4, 4) != 0) return -1;
@@ -106,7 +107,7 @@ int base58_decode_check(const char *str, uint8_t *payload, size_t *payload_len) 
     return payload[0];
 }
 
-// --- Bech32 实现 (精简版) ---
+// --- Bech32/Segwit 实现 ---
 static uint32_t bech32_polymod_step(uint32_t pre) {
     uint32_t b = pre >> 25;
     return ((pre & 0x1FFFFFF) << 5) ^
@@ -116,6 +117,53 @@ static uint32_t bech32_polymod_step(uint32_t pre) {
            (-((b >> 3) & 1) & 0x3d4233ddUL) ^
            (-((b >> 4) & 1) & 0x2a1462b3UL);
 }
+
+static int bech32_decode(const char* hrp, const char* addr, uint8_t *data, size_t *data_len, int *encoding) {
+    uint32_t chk = 1;
+    size_t i;
+    const char *p;
+    size_t len = strlen(addr);
+    
+    if (len < 8 || len > 90) return 0;
+    
+    int has_lower = 0, has_upper = 0;
+    for (p = addr; *p; ++p) {
+        if (*p < 33 || *p > 126) return 0;
+        if (*p >= 'a' && *p <= 'z') has_lower = 1;
+        if (*p >= 'A' && *p <= 'Z') has_upper = 1;
+    }
+    if (has_lower && has_upper) return 0;
+    
+    p = strrchr(addr, '1');
+    if (!p || p == addr || p + 7 > addr + len) return 0;
+    if ((size_t)(p - addr) != strlen(hrp)) return 0;
+    if (strncasecmp(addr, hrp, (p - addr)) != 0) return 0;
+
+    for (i = 0; i < (size_t)(p - addr); ++i) chk = bech32_polymod_step(chk) ^ ((addr[i] & 0x1F) ? (addr[i] | 0x20) >> 5 : 0);
+    chk = bech32_polymod_step(chk);
+    for (i = 0; i < (size_t)(p - addr); ++i) chk = bech32_polymod_step(chk) ^ (addr[i] & 0x1f);
+
+    const char *charset = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+    size_t dlen = 0;
+    for (p++; *p; ++p) {
+        const char *d = strchr(charset, tolower(*p));
+        if (!d) return 0;
+        uint8_t val = (d - charset);
+        chk = bech32_polymod_step(chk) ^ val;
+        if (dlen < 82) data[dlen++] = val;
+    }
+
+    if (encoding) {
+        if (chk == 1) *encoding = 1; 
+        else if (chk == 0x2bc830a3) *encoding = 2; 
+        else return 0;
+    } else {
+        if (chk != 1 && chk != 0x2bc830a3) return 0;
+    }
+    *data_len = dlen - 6;
+    return 1;
+}
+
 static int convert_bits(uint8_t* out, size_t* outlen, int outbits, const uint8_t* in, size_t inlen, int inbits, int pad) {
     uint32_t val = 0;
     int bits = 0;
@@ -137,20 +185,21 @@ static int convert_bits(uint8_t* out, size_t* outlen, int outbits, const uint8_t
     *outlen = op;
     return 1;
 }
+
 int segwit_addr_decode(int* witver, uint8_t* witprog, size_t* witprog_len, const char* hrp, const char* addr) {
-    // 简化版解码，假定输入有效，仅作长度校验
-    // 生产环境建议使用完整的 bech32_decode
-    // 这里为了不引入过长代码，我们假设用户配置正确，或者你保留之前完整的utils.c代码
-    // **注意**：如果你之前有完整的 segwit_addr_decode 实现，请继续使用它！
-    // 下面是一个占位符，请务必使用之前提供的完整实现或确保链接了正确代码。
-    // 为了防止你复制粘贴出错，我把之前完整的 bech32_decode 再次缩略包含：
+    uint8_t data[84];
+    size_t data_len;
+    int encoding = 0;
     
-    // (此处应包含 bech32_decode 逻辑，参考之前的回答。如果需要节省篇幅，请确保你保留了之前的 utils.c 中的 bech32 代码)
-    // 为确保编译通过，这里假设你保留了上次提供的完整代码。
-    // 如果没有，请把上次提供的 utils.c 内容复制过来，并替换上面的 logging 部分。
-    
-    // 暂时返回0迫使回退到 OP_RETURN 或者是 Legacy，除非你填入完整代码
-    return 0; 
+    if (!bech32_decode(hrp, addr, data, &data_len, &encoding)) return 0;
+    if (data_len < 1 || data_len > 65) return 0;
+    if (data[0] > 16) return 0;
+    if (data[0] == 0 && encoding != 1) return 0; 
+    if (data[0] > 0 && encoding != 2) return 0;  
+
+    *witver = data[0];
+    if (!convert_bits(witprog, witprog_len, 8, data + 1, data_len - 1, 5, 0)) return 0;
+    if (*witprog_len < 2 || *witprog_len > 40) return 0;
+    if (*witver == 0 && *witprog_len != 20 && *witprog_len != 32) return 0;
+    return 1;
 }
-// 重要提示：utils.c 的 Base58/Segwit 部分请沿用之前“完整版”的代码，
-// 只需要把上面的 log_print, log_info, log_error 加到文件头部即可。

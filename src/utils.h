@@ -12,4 +12,6 @@ void reverse_bytes(uint8_t *buf, size_t len);
 void swap32_buffer(uint8_t *buf, size_t len);
 uint32_t swap_uint32(uint32_t val);
 
+void address_to_script(const char *addr, char *script_hex);
+
 #endif

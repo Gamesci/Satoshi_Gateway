@@ -168,7 +168,6 @@ void *client_worker(void *arg) {
                         
                         log_info("Miner %d Authorized. Sending Job...", c->id);
                         
-                        // 1. Send Diff
                         json_t *dreq = json_object();
                         json_object_set_new(dreq, "id", json_null());
                         json_object_set_new(dreq, "method", json_string("mining.set_difficulty"));
@@ -178,12 +177,9 @@ void *client_worker(void *arg) {
                         send_json(c->sock, dreq);
                         json_decref(dreq);
                         
-                        // 2. Immediate Job Dispatch
                         Template tmpl;
                         if(bitcoin_get_current_job_copy(&tmpl)) {
                             stratum_send_mining_notify(c->sock, &tmpl);
-                        } else {
-                            log_info("No job available for Miner %d yet.", c->id);
                         }
                     }
                     else if(strcmp(method, "mining.configure") == 0) {
@@ -237,7 +233,6 @@ void *client_worker(void *arg) {
         }
     }
     
-    // Crash Fix: Removed free(c)
     client_remove(c);
     return NULL;
 }

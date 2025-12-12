@@ -90,7 +90,6 @@ void bitcoin_free_job(Template *t) {
     t->tx_count = 0;
 }
 
-// 关键函数：获取最新任务（复制到栈/堆内存，避免指针失效）
 bool bitcoin_get_latest_job(Template *out) {
     pthread_mutex_lock(&g_tmpl_lock);
     Template *curr = &g_jobs[g_job_head];
@@ -98,10 +97,13 @@ bool bitcoin_get_latest_job(Template *out) {
         pthread_mutex_unlock(&g_tmpl_lock);
         return false;
     }
-    *out = *curr; // 结构体拷贝
+    *out = *curr; 
     pthread_mutex_unlock(&g_tmpl_lock);
     return true;
 }
+
+// 前置声明 (Utils)
+void address_to_script(const char *addr, char *script_hex);
 
 void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, char *c2, const char *default_witness) {
     sprintf(c1, "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff");
@@ -164,7 +166,6 @@ int bitcoin_submit_block(const char *hex_data) {
 int bitcoin_validate_and_submit(const char *job_id, const char *full_extranonce, const char *ntime, uint32_t nonce, uint32_t version_mask) {
     pthread_mutex_lock(&g_tmpl_lock);
     
-    // 1. 从历史任务中查找 JobID
     Template *target_job = NULL;
     for(int i=0; i<MAX_JOB_HISTORY; i++) {
         if(g_jobs[i].valid && strcmp(g_jobs[i].job_id, job_id) == 0) {
@@ -191,7 +192,6 @@ int bitcoin_validate_and_submit(const char *job_id, const char *full_extranonce,
     uint32_t ver = (version_mask != 0) ? version_mask : target_job->version_val;
     *(uint32_t*)(header) = ver; 
     
-    // PrevHash 还原: Internal LE
     memcpy(header+4, target_job->prev_hash_bin, 32);
     
     uint8_t coinbase_bin[4096];
@@ -216,8 +216,7 @@ int bitcoin_validate_and_submit(const char *job_id, const char *full_extranonce,
     *(uint32_t*)(header+72) = target_job->nbits_val;
     *(uint32_t*)(header+76) = nonce; 
     
-    // Check hash logic (Optimistic)
-    // Always valid share (result=1), if block found (result=2)
+    // Check hash logic
     uint8_t block_hash[32];
     sha256_double(header, 80, block_hash);
     reverse_bytes(block_hash, 32); 
@@ -264,7 +263,6 @@ void bitcoin_update_template(bool force_clean) {
     
     pthread_mutex_lock(&g_tmpl_lock);
     
-    // Check if clean needed
     const char *new_prev = json_string_value(json_object_get(res, "previousblockhash"));
     uint8_t new_prev_bin[32];
     if(new_prev) { hex2bin(new_prev, new_prev_bin, 32); reverse_bytes(new_prev_bin, 32); }
@@ -279,10 +277,9 @@ void bitcoin_update_template(bool force_clean) {
         }
     }
     
-    // Use Next Slot
     g_job_head = (g_job_head + 1) % MAX_JOB_HISTORY;
     Template *curr = &g_jobs[g_job_head];
-    bitcoin_free_job(curr); // Free old data in this slot
+    bitcoin_free_job(curr);
     
     static int job_counter = 0;
     snprintf(curr->job_id, 32, "%x", ++job_counter);
@@ -291,25 +288,36 @@ void bitcoin_update_template(bool force_clean) {
     
     curr->height = json_integer_value(json_object_get(res, "height"));
     
-    // 1. Version
+    // --- 1. Version (SAFE COPY) ---
     curr->version_val = json_integer_value(json_object_get(res, "version"));
     json_t *j_ver = json_object_get(res, "versionHex");
-    if(j_ver) strncpy(curr->version_hex, json_string_value(j_ver), 8);
-    else sprintf(curr->version_hex, "%08x", curr->version_val);
+    if(j_ver) {
+        const char* v = json_string_value(j_ver);
+        // 关键修复: 确保不越界，并手动添加结束符
+        strncpy(curr->version_hex, v, 8);
+        curr->version_hex[8] = '\0'; // SAFETY
+    } else {
+        sprintf(curr->version_hex, "%08x", curr->version_val);
+    }
     
-    // 2. PrevHash
+    // --- 2. PrevHash ---
     memcpy(curr->prev_hash_bin, new_prev_bin, 32);
     uint8_t swap_buf[32];
     memcpy(swap_buf, curr->prev_hash_bin, 32);
     swap32_buffer(swap_buf, 32);
     bin2hex(swap_buf, 32, curr->prev_hash_stratum);
     
-    // 3. Bits
+    // --- 3. Bits (SAFE COPY) ---
     const char *bits = json_string_value(json_object_get(res, "bits"));
-    strncpy(curr->nbits_hex, bits, 8);
-    curr->nbits_val = strtoul(bits, NULL, 16);
+    if(bits) {
+        strncpy(curr->nbits_hex, bits, 8);
+        curr->nbits_hex[8] = '\0'; // SAFETY
+    } else {
+        strcpy(curr->nbits_hex, "1d00ffff");
+    }
+    curr->nbits_val = strtoul(curr->nbits_hex, NULL, 16);
     
-    // 4. Time
+    // --- 4. Time ---
     curr->curtime_val = json_integer_value(json_object_get(res, "curtime"));
     sprintf(curr->ntime_hex, "%08x", curr->curtime_val);
     
@@ -320,7 +328,7 @@ void bitcoin_update_template(bool force_clean) {
     json_t *txs = json_object_get(res, "transactions");
     if(txs) calculate_merkle_branch(txs, curr);
     
-    log_info("Job %s [H:%d Txs:%d Ver:%s] Clean:%d", curr->job_id, curr->height, curr->tx_count, curr->version_hex, clean_jobs);
+    log_info("Job %s [H:%d Tx:%d V:%s] Clean:%d", curr->job_id, curr->height, curr->tx_count, curr->version_hex, clean_jobs);
     
     stratum_broadcast_job(curr);
     

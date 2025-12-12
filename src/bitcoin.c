@@ -143,11 +143,11 @@ bool bitcoin_get_latest_job(Template *out) {
 // 声明 utils.c 中的函数
 void address_to_script(const char *addr, char *script_hex); 
 
-// 构建 Coinbase
+// 构建 Coinbase (完全对齐 BlockBuilder/CKPool 结构):
 // 1. Version 1 (01000000)
 // 2. Height First (BIP34)
-// 3. Tag Second
-// 4. ExtraNonce Push Third (Ends Coinb1)
+// 3. ExtraNonce Push Second (Coinb1 结束)
+// 4. Tag Third (Coinb2 开头)
 void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, char *c2, const char *default_witness) {
     int tag_len = strlen(msg);
     if(tag_len > 60) tag_len = 60; // 截断保护
@@ -175,15 +175,15 @@ void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, c
     // 计算 Tag Push Op 长度
     int tag_push_len = (tag_len > 0) ? ((tag_len >= 76) ? 2 : 1) : 0;
 
-    // ScriptSig 结构:
-    // [HeightPushOp(1)] + [HeightBytes(h_len)] + [TagOp] + [Tag] + [ENOp(1)] + [EN(en_total)]
-    int total_len = (1 + h_len) + tag_push_len + tag_len + 1 + en_total;
+    // ScriptSig 结构: [Height] + [EN_Push] + [EN] + [Tag]
+    // 注意：Pool Tag 将会被放在 Coinb2 中，但它仍然是 ScriptSig 的一部分，所以长度要算进去
+    int total_len = (1 + h_len) + 1 + en_total + tag_push_len + tag_len;
     
     // BIP34 限制 (100 bytes)
     if (total_len > 100) {
         tag_len = 0;
         tag_push_len = 0;
-        total_len = (1 + h_len) + 1 + en_total; // 仅保留 Height + EN
+        total_len = (1 + h_len) + 1 + en_total; 
     }
     
     // --- Coinb1 ---
@@ -197,23 +197,23 @@ void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, c
     sprintf(c1 + strlen(c1), "%02x", h_len); // Push Opcode
     for(int i=0; i<h_len; i++) sprintf(c1 + strlen(c1), "%02x", h_enc[i]);
     
-    // 2. Pool Tag (插入在 ExtraNonce 之前)
-    if (tag_len > 0) {
-        if (tag_len >= 76) sprintf(c1 + strlen(c1), "4c%02x", tag_len);
-        else sprintf(c1 + strlen(c1), "%02x", tag_len);
-        
-        for(int i=0; i<tag_len; i++) sprintf(c1 + strlen(c1), "%02x", (unsigned char)msg[i]);
-    }
-    
-    // 3. ExtraNonce Push Op (Coinb1 结尾)
-    // 这将生成操作码 (例如 0c)，表示接下来要推入12字节。
-    // 矿机会在收到 Coinb1 后，紧接着填入这12字节的 ExtraNonce。
+    // 2. ExtraNonce Push Op (Coinb1 结尾)
+    // 矿机会在后面追加 EN1 + EN2
     sprintf(c1 + strlen(c1), "%02x", en_total); 
     
     // --- Coinb2 ---
-    // Coinb2 紧随 ExtraNonce 之后，必须以 Sequence (ffffffff) 开头
+    // Coinb2 紧随 ExtraNonce 之后
+    // 3. Pool Tag (放在 Coinb2 开头)
+    c2[0] = '\0';
+    if (tag_len > 0) {
+        if (tag_len >= 76) sprintf(c2, "4c%02x", tag_len);
+        else sprintf(c2, "%02x", tag_len);
+        
+        for(int i=0; i<tag_len; i++) sprintf(c2 + strlen(c2), "%02x", (unsigned char)msg[i]);
+    }
+    
     // 4. Sequence
-    sprintf(c2, "ffffffff"); 
+    strcat(c2, "ffffffff"); 
     
     // Outputs
     int output_count = (default_witness && strlen(default_witness) > 0) ? 2 : 1;
@@ -306,7 +306,6 @@ int bitcoin_validate_and_submit(const char *job_id, const char *full_extranonce,
     
     uint8_t head[80];
     
-    // 区块头 Version 使用 Version Rolling (BIP320)
     uint32_t ver = job->version_val;
     if (g_config.version_mask != 0) {
         ver = (ver & ~g_config.version_mask) | (version_bits & g_config.version_mask);

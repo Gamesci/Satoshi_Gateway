@@ -7,6 +7,18 @@
 
 Config g_config;
 
+// 辅助函数：安全读取字符串，防止 NULL 导致 crash
+static void safe_read_string(json_t *root, const char *key, char *dest, size_t dest_size) {
+    json_t *obj = json_object_get(root, key);
+    if (!obj) return; // 键不存在，保持默认值或空
+    
+    const char *val = json_string_value(obj);
+    if (val) {
+        strncpy(dest, val, dest_size - 1);
+        dest[dest_size - 1] = '\0'; // 确保 NULL 结尾
+    }
+}
+
 int load_config(const char *filename) {
     json_error_t error;
     json_t *root = json_load_file(filename, 0, &error);
@@ -15,57 +27,69 @@ int load_config(const char *filename) {
         return -1;
     }
 
-    // RPC & Network
-    strncpy(g_config.rpc_url, json_string_value(json_object_get(root, "rpc_url")), sizeof(g_config.rpc_url)-1);
-    const char *rpc_host = json_string_value(json_object_get(root, "rpc_host")); // 兼容旧配置
-    if(rpc_host) snprintf(g_config.rpc_url, sizeof(g_config.rpc_url), "http://%s", rpc_host);
-    
-    strncpy(g_config.rpc_user, json_string_value(json_object_get(root, "rpc_user")), sizeof(g_config.rpc_user)-1);
-    strncpy(g_config.rpc_pass, json_string_value(json_object_get(root, "rpc_pass")), sizeof(g_config.rpc_pass)-1);
-    
-    const char *zmq = json_string_value(json_object_get(root, "zmq_pub_hashblock"));
-    if(zmq) strncpy(g_config.zmq_addr, zmq, sizeof(g_config.zmq_addr)-1);
-    else g_config.zmq_addr[0] = 0;
+    // 1. RPC URL 处理 (优先 rpc_url，其次用 rpc_host 拼接)
+    const char *url = json_string_value(json_object_get(root, "rpc_url"));
+    if (url) {
+        strncpy(g_config.rpc_url, url, sizeof(g_config.rpc_url) - 1);
+    } else {
+        // 兼容旧配置 rpc_host
+        const char *host = json_string_value(json_object_get(root, "rpc_host"));
+        if (host) {
+            snprintf(g_config.rpc_url, sizeof(g_config.rpc_url), "http://%s", host);
+        } else {
+            // 如果两个都没有，这是一个严重错误
+            log_error("Config Error: Missing 'rpc_url' or 'rpc_host'!");
+            json_decref(root);
+            return -1;
+        }
+    }
 
-    // Mining Info
-    const char *reward = json_string_value(json_object_get(root, "reward_address"));
-    if(reward) strncpy(g_config.payout_addr, reward, sizeof(g_config.payout_addr)-1);
-    
-    const char *tag = json_string_value(json_object_get(root, "pool_tag"));
-    if(tag) strncpy(g_config.coinbase_tag, tag, sizeof(g_config.coinbase_tag)-1);
+    // 2. 其他字符串字段 (使用安全读取函数)
+    safe_read_string(root, "rpc_user", g_config.rpc_user, sizeof(g_config.rpc_user));
+    safe_read_string(root, "rpc_pass", g_config.rpc_pass, sizeof(g_config.rpc_pass));
+    safe_read_string(root, "zmq_pub_hashblock", g_config.zmq_addr, sizeof(g_config.zmq_addr));
+    safe_read_string(root, "reward_address", g_config.payout_addr, sizeof(g_config.payout_addr));
+    safe_read_string(root, "pool_tag", g_config.coinbase_tag, sizeof(g_config.coinbase_tag));
 
-    // Stratum Settings
+    // 3. 端口 (支持字符串或整数)
     json_t *port = json_object_get(root, "listen_port");
-    if(json_is_string(port)) g_config.stratum_port = atoi(json_string_value(port));
-    else g_config.stratum_port = json_integer_value(port);
+    if (port) {
+        if (json_is_string(port)) g_config.stratum_port = atoi(json_string_value(port));
+        else if (json_is_integer(port)) g_config.stratum_port = json_integer_value(port);
+    }
+    if (g_config.stratum_port <= 0) g_config.stratum_port = 3333;
 
-    // Difficulty & VarDiff
-    // 读取 diff_asic 作为初始难度
+    // 4. 难度与 VarDiff
     json_t *diff = json_object_get(root, "diff_asic");
-    if(diff) g_config.initial_diff = json_integer_value(diff);
-    else g_config.initial_diff = 1024; // 默认值
+    if (diff) g_config.initial_diff = json_integer_value(diff);
+    else g_config.initial_diff = 1024;
 
-    // 读取 vardiff_target_shares_min
     json_t *vd_target = json_object_get(root, "vardiff_target_shares_min");
-    if(vd_target) g_config.vardiff_target = json_integer_value(vd_target);
-    else g_config.vardiff_target = 20; // 默认每分钟 20 Shares
+    if (vd_target) g_config.vardiff_target = json_integer_value(vd_target);
+    else g_config.vardiff_target = 20;
 
-    // 自动设定最小/最大难度范围
-    g_config.vardiff_min_diff = g_config.initial_diff / 4; 
+    // 自动设定 VarDiff 范围
+    g_config.vardiff_min_diff = g_config.initial_diff / 4;
     if (g_config.vardiff_min_diff < 1) g_config.vardiff_min_diff = 1;
-    g_config.vardiff_max_diff = g_config.initial_diff * 4096; 
+    g_config.vardiff_max_diff = g_config.initial_diff * 4096;
 
-    // Others
+    // 5. 轮询间隔 (支持 "30s" 这种带单位的字符串)
     json_t *poll = json_object_get(root, "poll_interval");
-    if(poll && json_is_string(poll)) g_config.poll_interval_sec = atoi(json_string_value(poll));
-    else g_config.poll_interval_sec = 30;
+    if (poll) {
+        if (json_is_string(poll)) g_config.poll_interval_sec = atoi(json_string_value(poll));
+        else if (json_is_integer(poll)) g_config.poll_interval_sec = json_integer_value(poll);
+    }
+    if (g_config.poll_interval_sec <= 0) g_config.poll_interval_sec = 30;
 
+    // 6. 其他配置
     json_t *en2 = json_object_get(root, "extranonce2_size");
-    g_config.extranonce2_size = en2 ? json_integer_value(en2) : 8;
+    g_config.extranonce2_size = (en2 && json_is_integer(en2)) ? json_integer_value(en2) : 8;
 
-    g_config.version_mask = 0; // 默认不做 version rolling
+    g_config.version_mask = 0;
     json_t *vm = json_object_get(root, "version_mask");
-    if(vm) g_config.version_mask = strtoul(json_string_value(vm), NULL, 16);
+    if (vm && json_is_string(vm)) {
+        g_config.version_mask = strtoul(json_string_value(vm), NULL, 16);
+    }
 
     json_decref(root);
     return 0;

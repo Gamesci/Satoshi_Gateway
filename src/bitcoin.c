@@ -14,6 +14,9 @@
 static Template g_current_tmpl = {0};
 static pthread_mutex_t g_tmpl_lock = PTHREAD_MUTEX_INITIALIZER;
 
+// 前置声明
+void address_to_script(const char *addr, char *script_hex);
+
 struct MemoryStruct { char *memory; size_t size; };
 static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp) {
     size_t realsize = size * nmemb;
@@ -33,7 +36,10 @@ static json_t* rpc_call(const char *method, json_t *params) {
     chunk.memory = malloc(1);
     chunk.size = 0;
     curl = curl_easy_init();
-    if (!curl) { log_error("Failed to init CURL"); return NULL; }
+    if (!curl) {
+        log_error("Failed to init CURL");
+        return NULL;
+    }
     
     json_t *req = json_object();
     json_object_set_new(req, "jsonrpc", json_string("1.0"));
@@ -56,26 +62,36 @@ static json_t* rpc_call(const char *method, json_t *params) {
     
     CURLcode res = curl_easy_perform(curl);
     json_t *response = NULL;
+    
     if (res == CURLE_OK) {
         json_error_t err;
         response = json_loads(chunk.memory, 0, &err);
-        if (!response) log_error("RPC JSON Parse Error. Raw: %.100s...", chunk.memory);
+        if (!response) {
+            log_error("RPC JSON Parse Error. Raw: %.100s...", chunk.memory);
+        }
     } else {
         log_error("RPC Connection Failed: %s", curl_easy_strerror(res));
     }
     
-    free(post_data); free(chunk.memory);
-    curl_slist_free_all(headers); curl_easy_cleanup(curl);
+    free(post_data);
+    free(chunk.memory);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
     json_decref(req);
     return response;
 }
 
-int bitcoin_init() { return curl_global_init(CURL_GLOBAL_ALL); }
+int bitcoin_init() {
+    return curl_global_init(CURL_GLOBAL_ALL);
+}
 
 void bitcoin_cleanup_template(Template *t) {
     if (t->tx_hexs) {
-        for (int i = 0; i < t->tx_count; i++) if (t->tx_hexs[i]) free(t->tx_hexs[i]);
-        free(t->tx_hexs); t->tx_hexs = NULL;
+        for (int i = 0; i < t->tx_count; i++) {
+            if (t->tx_hexs[i]) free(t->tx_hexs[i]);
+        }
+        free(t->tx_hexs);
+        t->tx_hexs = NULL;
     }
     t->tx_count = 0;
 }
@@ -86,10 +102,19 @@ bool bitcoin_get_current_job_copy(Template *out) {
         pthread_mutex_unlock(&g_tmpl_lock);
         return false;
     }
-    *out = g_current_tmpl; // Struct copy
-    // TX Hexs are pointers, but for mining notify we only need header info, not TXs.
-    // Stratum broadcast only uses header & merkle.
-    // Be careful not to use out->tx_hexs or free it.
+    strcpy(out->job_id, g_current_tmpl.job_id);
+    strcpy(out->prev_hash, g_current_tmpl.prev_hash);
+    strcpy(out->coinb1, g_current_tmpl.coinb1);
+    strcpy(out->coinb2, g_current_tmpl.coinb2);
+    strcpy(out->version, g_current_tmpl.version);
+    strcpy(out->nbits, g_current_tmpl.nbits);
+    strcpy(out->ntime, g_current_tmpl.ntime);
+    out->height = g_current_tmpl.height;
+    out->clean_jobs = false;
+    out->merkle_count = g_current_tmpl.merkle_count;
+    for(int i=0; i<out->merkle_count; i++) {
+        strcpy(out->merkle_branch[i], g_current_tmpl.merkle_branch[i]);
+    }
     pthread_mutex_unlock(&g_tmpl_lock);
     return true;
 }
@@ -98,8 +123,10 @@ void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, c
     sprintf(c1, "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff");
     uint8_t h_le[4];
     h_le[0]=height&0xff; h_le[1]=(height>>8)&0xff; h_le[2]=(height>>16)&0xff; h_le[3]=(height>>24)&0xff;
+    
     char tag_hex[128] = {0};
     for(int i=0; msg[i] && i<20; i++) sprintf(tag_hex + i*2, "%02x", (unsigned char)msg[i]);
+    
     char script_sig[256];
     sprintf(script_sig, "2003%02x%02x%02x14%s", h_le[0], h_le[1], h_le[2], tag_hex);
     strcat(c1, script_sig);
@@ -146,8 +173,11 @@ void calculate_merkle_branch(json_t *txs, Template *tmpl) {
         json_t *tx = json_array_get(txs, i);
         const char *txid_hex = json_string_value(json_object_get(tx, "txid"));
         const char *data_hex = json_string_value(json_object_get(tx, "data"));
+        
         if(!txid_hex || !data_hex) {
-             tmpl->tx_hexs[i] = strdup(""); memset(leaves[i+1], 0, 32); continue;
+             tmpl->tx_hexs[i] = strdup(""); 
+             memset(leaves[i+1], 0, 32);
+             continue;
         }
         tmpl->tx_hexs[i] = strdup(data_hex);
         uint8_t bin[32];
@@ -208,6 +238,7 @@ int bitcoin_submit_block(const char *hex_data) {
 
 int bitcoin_reconstruct_and_submit(const char *job_id, const char *full_extranonce, const char *ntime, uint32_t nonce, uint32_t version_mask) {
     pthread_mutex_lock(&g_tmpl_lock);
+    
     if (strcmp(job_id, g_current_tmpl.job_id) != 0) {
         pthread_mutex_unlock(&g_tmpl_lock);
         return 0; 
@@ -215,6 +246,7 @@ int bitcoin_reconstruct_and_submit(const char *job_id, const char *full_extranon
 
     char coinbase_hex[8192];
     sprintf(coinbase_hex, "%s%s%s", g_current_tmpl.coinb1, full_extranonce, g_current_tmpl.coinb2);
+    
     size_t total_size = 80 + 2048 + 2048; 
     for(int i=0; i<g_current_tmpl.tx_count; i++) total_size += strlen(g_current_tmpl.tx_hexs[i]);
     char *block_hex = malloc(total_size * 2);
@@ -222,26 +254,14 @@ int bitcoin_reconstruct_and_submit(const char *job_id, const char *full_extranon
     
     uint8_t header[80];
     uint32_t ver = (version_mask != 0) ? version_mask : g_current_tmpl.version_int;
-    *(uint32_t*)(header) = ver; // LE
+    *(uint32_t*)(header) = ver; 
     
-    // PrevHash: 还原为 Little Endian 存入 Header
-    // 内存中的 g_current_tmpl.prev_hash 是 Stratum 格式 (swap32ed)
-    // 我们需要再次 swap32 变回 RPC 的 BigEndian? 不，Header 需要 Little Endian
-    // RPC (BE) -> swap32 -> Stratum.
-    // Stratum -> swap32 -> RPC (BE).
-    // Header 需要 Little Endian (Full Reverse of RPC BE).
-    // 所以 Header = reverse_bytes(RPC BE).
-    // Header = reverse_bytes( swap32( Stratum ) ).
-    // Let's do:
-    uint8_t stratum_prev[32];
-    hex2bin(g_current_tmpl.prev_hash, stratum_prev, 32);
-    // stratum_prev is currently swap32'd relative to RPC BE.
-    // We need LE.
-    // RPC BE = swap32(stratum_prev).
-    // LE = reverse_bytes(RPC BE).
-    swap32_buffer(stratum_prev, 32); // Now it's RPC BE
-    reverse_bytes(stratum_prev, 32); // Now it's LE
-    memcpy(header+4, stratum_prev, 32);
+    // PrevHash Reconstruct:
+    // Stratum (Word Swapped) -> Swap32 -> Little Endian (Header Format)
+    uint8_t prev_bin[32];
+    hex2bin(g_current_tmpl.prev_hash, prev_bin, 32);
+    swap32_buffer(prev_bin, 32); // 还原为 LE
+    memcpy(header+4, prev_bin, 32);
     
     uint8_t coinbase_bin[4096];
     size_t cb_len = strlen(coinbase_hex) / 2;
@@ -261,7 +281,7 @@ int bitcoin_reconstruct_and_submit(const char *job_id, const char *full_extranon
     memcpy(header+36, current_hash, 32);
     
     uint32_t t_val = strtoul(ntime, NULL, 16);
-    *(uint32_t*)(header+68) = t_val; // Stratum NTime is usually BE, strtoul makes it int, write to LE
+    *(uint32_t*)(header+68) = t_val; 
     *(uint32_t*)(header+72) = g_current_tmpl.nbits_int;
     *(uint32_t*)(header+76) = nonce; 
     
@@ -270,6 +290,7 @@ int bitcoin_reconstruct_and_submit(const char *job_id, const char *full_extranon
     uint8_t vi[9];
     int vi_len = encode_varint(vi, 1 + g_current_tmpl.tx_count);
     bin2hex(vi, vi_len, p); p += (vi_len * 2);
+    
     strcpy(p, coinbase_hex); p += strlen(coinbase_hex);
     for(int i=0; i<g_current_tmpl.tx_count; i++) {
         strcpy(p, g_current_tmpl.tx_hexs[i]);
@@ -293,9 +314,26 @@ void bitcoin_update_template(bool clean_jobs) {
     json_array_append_new(params, args);
     
     json_t *resp = rpc_call("getblocktemplate", params);
-    if(!resp) return;
+    
+    if(!resp) {
+        log_error("RPC Call returned NULL.");
+        return;
+    }
+
+    json_t *error = json_object_get(resp, "error");
+    if (error && !json_is_null(error)) {
+        json_t *msg = json_object_get(error, "message");
+        log_error("Node Error: %s", json_is_string(msg) ? json_string_value(msg) : "Unknown");
+        json_decref(resp);
+        return;
+    }
+
     json_t *res = json_object_get(resp, "result");
-    if(!res) { json_decref(resp); return; }
+    if (!res || !json_is_object(res)) {
+        log_error("Invalid RPC: result is missing");
+        json_decref(resp);
+        return;
+    }
     
     pthread_mutex_lock(&g_tmpl_lock);
     bitcoin_cleanup_template(&g_current_tmpl);
@@ -305,25 +343,38 @@ void bitcoin_update_template(bool clean_jobs) {
     g_current_tmpl.clean_jobs = clean_jobs;
     
     g_current_tmpl.height = json_integer_value(json_object_get(res, "height"));
+    
+    // Version: 优先使用 versionHex，缺失则回退到 version int
+    json_t *j_ver_hex = json_object_get(res, "versionHex");
     g_current_tmpl.version_int = json_integer_value(json_object_get(res, "version"));
     
-    // 关键修正 1: Version 直接使用整数格式化，不反转 -> 20000000
-    sprintf(g_current_tmpl.version, "%08x", g_current_tmpl.version_int);
+    if (j_ver_hex) {
+        const char *ver_hex = json_string_value(j_ver_hex);
+        strncpy(g_current_tmpl.version, ver_hex, 8);
+    } else {
+        sprintf(g_current_tmpl.version, "%08x", g_current_tmpl.version_int);
+    }
     
     const char *bits = json_string_value(json_object_get(res, "bits"));
-    strncpy(g_current_tmpl.nbits, bits, 8);
-    g_current_tmpl.nbits_int = strtoul(bits, NULL, 16);
+    if(bits) strncpy(g_current_tmpl.nbits, bits, 8);
+    else strcpy(g_current_tmpl.nbits, "1d00ffff");
+    g_current_tmpl.nbits_int = strtoul(g_current_tmpl.nbits, NULL, 16);
     
     g_current_tmpl.ntime_int = json_integer_value(json_object_get(res, "curtime"));
-    // 关键修正 2: Time 直接格式化，不反转 -> 693c...
     sprintf(g_current_tmpl.ntime, "%08x", g_current_tmpl.ntime_int);
     
+    // PrevHash: RPC(BE) -> Reverse -> Swap32
     const char *prev = json_string_value(json_object_get(res, "previousblockhash"));
-    // 关键修正 3: PrevHash 使用 32-bit Word Swap (6d75... -> e828...)
-    uint8_t prev_bin[32];
-    hex2bin(prev, prev_bin, 32);
-    swap32_buffer(prev_bin, 32); // 4字节反转
-    bin2hex(prev_bin, 32, g_current_tmpl.prev_hash);
+    if(prev) {
+        uint8_t prev_bin[32];
+        hex2bin(prev, prev_bin, 32);
+        reverse_bytes(prev_bin, 32); // To Little Endian
+        swap32_buffer(prev_bin, 32); // To Stratum Words
+        bin2hex(prev_bin, 32, g_current_tmpl.prev_hash);
+    } else {
+        log_error("PrevHash missing! Check Node.");
+        memset(g_current_tmpl.prev_hash, '0', 64);
+    }
     
     int64_t coin_val = json_integer_value(json_object_get(res, "coinbasevalue"));
     const char *def_wit = json_string_value(json_object_get(res, "default_witness_commitment"));
@@ -334,10 +385,10 @@ void bitcoin_update_template(bool clean_jobs) {
     if(txs) calculate_merkle_branch(txs, &g_current_tmpl);
     else g_current_tmpl.merkle_count = 0;
     
-    log_info("Job %s: Ver=%s Time=%s Prev=%.8s...", 
-             g_current_tmpl.job_id, g_current_tmpl.version, g_current_tmpl.ntime, g_current_tmpl.prev_hash);
+    log_info("New Job #%s Height:%d Txs:%d Ver:%s", g_current_tmpl.job_id, g_current_tmpl.height, g_current_tmpl.tx_count, g_current_tmpl.version);
     
     stratum_broadcast_job(&g_current_tmpl);
+    
     pthread_mutex_unlock(&g_tmpl_lock);
     json_decref(resp);
 }

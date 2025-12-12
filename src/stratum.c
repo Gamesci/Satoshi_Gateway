@@ -36,6 +36,12 @@ Client* client_add(int sock, struct sockaddr_in addr) {
     for(int i=0; i<MAX_CLIENTS; i++) {
         if(!g_clients[i].active) {
             g_clients[i].active=true; g_clients[i].sock=sock; g_clients[i].addr=addr; g_clients[i].id=i+1; g_clients[i].is_authorized=false;
+            
+            // VarDiff Init
+            g_clients[i].current_diff = (double)g_config.initial_diff;
+            g_clients[i].last_retarget_time = time(NULL);
+            g_clients[i].shares_in_window = 0;
+
             snprintf(g_clients[i].extranonce1_hex, 9, "%08x", g_clients[i].id);
             pthread_mutex_unlock(&g_clients_lock); return &g_clients[i];
         }
@@ -52,6 +58,17 @@ void client_remove(Client *c) {
 void send_json(int sock, json_t *response) {
     char *s = json_dumps(response, 0);
     if(s) { size_t l=strlen(s); char *m=malloc(l+2); strcpy(m, s); m[l]='\n'; m[l+1]=0; send(sock, m, l+1, MSG_NOSIGNAL); free(m); free(s); }
+}
+
+void send_difficulty(Client *c, double diff) {
+    json_t *res = json_object();
+    json_object_set_new(res, "id", json_null());
+    json_object_set_new(res, "method", json_string("mining.set_difficulty"));
+    json_t *params = json_array();
+    json_array_append_new(params, json_real(diff));
+    json_object_set_new(res, "params", params);
+    send_json(c->sock, res);
+    json_decref(res);
 }
 
 void stratum_send_mining_notify(int sock, Template *tmpl) {
@@ -110,9 +127,10 @@ void *client_worker(void *arg) {
                         c->is_authorized=true;
                         json_object_set_new(res, "error", json_null()); json_object_set_new(res, "result", json_true());
                         send_json(c->sock, res); log_info("ID=%d Authorized", c->id);
-                        json_t *dr=json_object(); json_object_set_new(dr, "id", json_null()); json_object_set_new(dr, "method", json_string("mining.set_difficulty"));
-                        json_t *dp=json_array(); json_array_append_new(dp, json_integer(g_config.initial_diff)); json_object_set_new(dr, "params", dp);
-                        send_json(c->sock, dr); json_decref(dr);
+                        
+                        // 发送初始难度
+                        send_difficulty(c, c->current_diff);
+                        
                         Template *t=malloc(sizeof(Template));
                         if(t) { if(bitcoin_get_latest_job(t)) stratum_send_mining_notify(c->sock, t); free(t); }
                     }
@@ -137,13 +155,39 @@ void *client_worker(void *arg) {
                             uint32_t vm = 0; if(json_array_size(p)>=6) { const char *vh=json_string_value(json_array_get(p, 5)); if(vh) vm=strtoul(vh, NULL, 16); }
                             uint32_t n = (uint32_t)strtoul(nh, NULL, 16);
                             char full[64]; snprintf(full, sizeof(full), "%s%s", c->extranonce1_hex, en2);
+                            
+                            // 验证时暂不传入当前难度做严格校验，只做基本有效性检查
                             int ret = bitcoin_validate_and_submit(jid, full, nt, n, vm);
+                            
                             if(ret==0) {
                                 json_object_set_new(res, "result", json_false());
                                 json_t *e=json_array(); json_array_append_new(e, json_integer(21)); json_array_append_new(e, json_string("Stale")); json_object_set_new(res, "error", e);
                             } else {
                                 json_object_set_new(res, "result", json_true()); json_object_set_new(res, "error", json_null());
-                                if(ret==2) log_info(">>> BLOCK FOUND! <<<");
+                                
+                                // VarDiff Logic
+                                c->shares_in_window++;
+                                time_t now = time(NULL);
+                                double dt = difftime(now, c->last_retarget_time);
+                                if (dt >= 60.0) {
+                                    double spm = (c->shares_in_window / dt) * 60.0;
+                                    double target = (double)g_config.vardiff_target;
+                                    double new_diff = c->current_diff;
+                                    bool changed = false;
+                                    if (spm < target * 0.4) { new_diff /= 2.0; changed=true; }
+                                    else if (spm > target * 1.5) { new_diff *= 2.0; changed=true; }
+                                    
+                                    if(new_diff < g_config.vardiff_min_diff) new_diff=g_config.vardiff_min_diff;
+                                    if(new_diff > g_config.vardiff_max_diff) new_diff=g_config.vardiff_max_diff;
+
+                                    if(changed && new_diff != c->current_diff) {
+                                        log_info("VarDiff ID=%d: %.0f -> %.0f (SPM: %.1f)", c->id, c->current_diff, new_diff, spm);
+                                        c->current_diff = new_diff;
+                                        send_difficulty(c, new_diff);
+                                    }
+                                    c->last_retarget_time = now;
+                                    c->shares_in_window = 0;
+                                }
                             }
                         }
                         send_json(c->sock, res);

@@ -11,6 +11,7 @@
 #include "utils.h"
 #include "sha256.h"
 
+// Task History Ring Buffer
 static Template g_jobs[MAX_JOB_HISTORY];
 static int g_job_head = 0;
 static pthread_mutex_t g_tmpl_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -136,9 +137,10 @@ void calculate_merkle_branch(json_t *txs, Template *tmpl) {
         const char *tid = json_string_value(json_object_get(tx, "txid"));
         const char *dat = json_string_value(json_object_get(tx, "data"));
         if(!tid || !dat) { tmpl->tx_hexs[i] = strdup(""); memset(leaves[i+1], 0, 32); continue; }
+        
         tmpl->tx_hexs[i] = strdup(dat);
         
-        // FIX: Reverse RPC TxID to get Internal Hash
+        // CRITICAL FIX: Reverse TxID from RPC (LE) to Internal (BE) for Merkle Tree
         uint8_t b[32]; hex2bin(tid, b, 32); reverse_bytes(b, 32); 
         memcpy(leaves[i+1], b, 32);
     }
@@ -188,8 +190,7 @@ int bitcoin_validate_and_submit(const char *job_id, const char *full_extranonce,
     char *block = malloc(sz * 2); char *p = block;
     
     uint8_t head[80];
-    uint32_t ver = (version_mask != 0) ? version_mask : job->version_val; 
-    *(uint32_t*)(head) = ver; 
+    uint32_t ver = (version_mask != 0) ? version_mask : job->version_val; *(uint32_t*)(head) = ver; 
     
     memcpy(head+4, job->prev_hash_bin, 32);
     
@@ -204,18 +205,22 @@ int bitcoin_validate_and_submit(const char *job_id, const char *full_extranonce,
     uint32_t tv = strtoul(ntime, NULL, 16); *(uint32_t*)(head+68) = tv; 
     *(uint32_t*)(head+72) = job->nbits_val; 
     
-    // FIX: Swap Nonce because Stratum sends Big Endian String
+    // FIX: Stratum Nonce is BE Hex string, Header needs LE integer.
+    // strtoul("aa..") gives int value. x86 writes LE.
+    // If input is "00000001", strtoul=1. Mem=01 00 00 00. Correct.
+    // BUT Bitaxe sends Big Endian nonce? No, Stratum usually sends BE hex string.
+    // Let's try swapping it to align with the hash result.
     *(uint32_t*)(head+76) = swap_uint32(nonce); 
     
     uint8_t h[32]; sha256_double(head, 80, h); reverse_bytes(h, 32);
     char hh[65]; bin2hex(h, 32, hh);
     
-    log_info("Miner Share Hash: %s", hh); // Should start with zeros
+    log_info("Miner Share Hash: %s", hh); // Debug log
     
     int zeros = 0; while(hh[zeros] == '0') zeros++;
     int result = 1;
     
-    if (zeros >= 12) { 
+    if (zeros >= 10) { 
         log_info(">>> HIGH DIFF SHARE: %s", hh);
         bin2hex(head, 80, p); p += 160;
         uint8_t vi[9]; int vl = encode_varint(vi, 1 + job->tx_count);

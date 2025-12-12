@@ -12,9 +12,10 @@ find_package(OpenSSL REQUIRED)
 
 include_directories(${JANSSON_INCLUDE_DIRS} ${CURL_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR} src)
 
-# 源文件
+# 源文件列表 (增加了 config.c)
 set(SOURCES
     src/main.c
+    src/config.c
     src/utils.c
     src/sha256.c
     src/stratum.c

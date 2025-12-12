@@ -140,9 +140,11 @@ bool bitcoin_get_latest_job(Template *out) {
     return true;
 }
 
+// 声明 utils.c 中的函数
 void address_to_script(const char *addr, char *script_hex); 
 
 // 构建 Coinbase: 
+// 修复点：修正 total_len 计算逻辑，确保 VarInt 与实际数据长度完全一致。
 void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, char *c2, const char *default_witness) {
     int tag_len = strlen(msg);
     if(tag_len > 60) tag_len = 60; // 截断保护
@@ -152,31 +154,35 @@ void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, c
     int en_total = en1_size + en2_size;
     
     // 计算 Tag Push Op 长度
-    int tag_push_len = (tag_len >= 76) ? 2 : 1;
-    if (tag_len == 0) tag_push_len = 0;
+    // 如果 tag_len >= 76 (0x4c)，Opcode 是 2 字节 (4c + len)
+    // 否则是 1 字节 (len)
+    int tag_push_len = (tag_len > 0) ? ((tag_len >= 76) ? 2 : 1) : 0;
 
-    int total_len = 4 + 1 + en_total + 1 + tag_push_len + tag_len;
+    // ScriptSig 结构:
+    // [Height(4)] + [TagOp] + [Tag] + [ENOp(1)] + [EN(12)]
+    // 之前的版本多算了一个字节，导致 VarInt 错误
+    int total_len = 4 + tag_push_len + tag_len + 1 + en_total;
     
-    // BIP34 限制
+    // BIP34 限制 (100 bytes)
     if (total_len > 100) {
         tag_len = 0;
         tag_push_len = 0;
-        total_len = 4 + 1 + en_total + 1;
+        total_len = 4 + 1 + en_total; // 仅保留 Height + EN
     }
     
     // --- Coinb1 ---
     // Header
     sprintf(c1, "010000000100000000000000000000000000000000000000000000000000000000ffffffff");
     
-    // Script Length
+    // Script Length (VarInt)
     char len_hex[10]; sprintf(len_hex, "%02x", total_len); strcat(c1, len_hex);
     
-    // 1. BIP34 Height
+    // 1. BIP34 Height (4 bytes: 03 + 3 bytes height)
     uint8_t h_le[4]; 
     h_le[0]=height&0xff; h_le[1]=(height>>8)&0xff; h_le[2]=(height>>16)&0xff; h_le[3]=(height>>24)&0xff;
     sprintf(c1 + strlen(c1), "03%02x%02x%02x", h_le[0], h_le[1], h_le[2]);
     
-    // 2. Pool Tag (移至 Coinb1)
+    // 2. Pool Tag (移至 Coinb1, 位于 EN 之前)
     if (tag_len > 0) {
         if (tag_len >= 76) sprintf(c1 + strlen(c1), "4c%02x", tag_len);
         else sprintf(c1 + strlen(c1), "%02x", tag_len);
@@ -189,7 +195,7 @@ void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, c
     sprintf(c1 + strlen(c1), "%02x", en_total); 
     
     // --- Coinb2 ---
-    // 4. Sequence (必须位于 Coinb2 开头，以便矿机识别)
+    // 4. Sequence (必须位于 Coinb2 开头)
     sprintf(c2, "ffffffff"); 
     
     // Outputs

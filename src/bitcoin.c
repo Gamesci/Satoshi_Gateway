@@ -143,7 +143,9 @@ bool bitcoin_get_latest_job(Template *out) {
 // 声明 utils.c 中的函数
 void address_to_script(const char *addr, char *script_hex); 
 
-// 构建 Coinbase (修复版：符合 BIP34 动态高度编码)
+// 构建 Coinbase: 
+// 修复点1: 升级交易版本为 Version 2 (02000000)，符合 SegWit/BIP68 标准
+// 修复点2: 使用 BIP34 动态高度编码，避免硬编码长度导致的校验错误
 void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, char *c2, const char *default_witness) {
     int tag_len = strlen(msg);
     if(tag_len > 60) tag_len = 60; // 截断保护
@@ -152,7 +154,7 @@ void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, c
     int en2_size = g_config.extranonce2_size;
     int en_total = en1_size + en2_size;
     
-    // --- BIP34 高度动态编码 (修复点) ---
+    // --- BIP34 高度动态编码 (关键修复) ---
     uint8_t h_enc[8];
     int h_len = 0;
     uint32_t temp_h = height;
@@ -183,19 +185,17 @@ void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, c
     }
     
     // --- Coinb1 ---
-    // Header
-    sprintf(c1, "010000000100000000000000000000000000000000000000000000000000000000ffffffff");
+    // Header - 修复: 使用 Version 2 (02000000)
+    sprintf(c1, "020000000100000000000000000000000000000000000000000000000000000000ffffffff");
     
     // Script Length (VarInt)
     char len_hex[10]; sprintf(len_hex, "%02x", total_len); strcat(c1, len_hex);
     
     // 1. BIP34 Height (动态写入)
     sprintf(c1 + strlen(c1), "%02x", h_len); // Push Opcode
-    for(int i=0; i<h_len; i++) {
-        sprintf(c1 + strlen(c1), "%02x", h_enc[i]);
-    }
+    for(int i=0; i<h_len; i++) sprintf(c1 + strlen(c1), "%02x", h_enc[i]);
     
-    // 2. Pool Tag (移至 Coinb1, 位于 EN 之前)
+    // 2. Pool Tag
     if (tag_len > 0) {
         if (tag_len >= 76) sprintf(c1 + strlen(c1), "4c%02x", tag_len);
         else sprintf(c1 + strlen(c1), "%02x", tag_len);
@@ -208,7 +208,7 @@ void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, c
     sprintf(c1 + strlen(c1), "%02x", en_total); 
     
     // --- Coinb2 ---
-    // 4. Sequence (必须位于 Coinb2 开头)
+    // 4. Sequence
     sprintf(c2, "ffffffff"); 
     
     // Outputs
@@ -227,9 +227,9 @@ void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, c
     char sl_hex[10]; sprintf(sl_hex, "%02x", (int)strlen(script_pub)/2);
     strcat(c2, sl_hex); strcat(c2, script_pub);
 
-    // Witness
+    // Witness Commitment (Output 2)
     if (output_count > 1) {
-        strcat(c2, "0000000000000000"); 
+        strcat(c2, "0000000000000000"); // Value 0
         char w_len_hex[10]; sprintf(w_len_hex, "%02x", (int)strlen(default_witness)/2);
         strcat(c2, w_len_hex); strcat(c2, default_witness);
     }

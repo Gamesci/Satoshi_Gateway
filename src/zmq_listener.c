@@ -24,7 +24,6 @@ void *zmq_thread(void *arg) {
         return NULL;
     }
 
-    // 订阅 "hashblock" 主题
     zmq_setsockopt(subscriber, ZMQ_SUBSCRIBE, "hashblock", 9);
     
     log_info("ZMQ Listening on %s ...", g_config.zmq_addr);
@@ -35,15 +34,13 @@ void *zmq_thread(void *arg) {
         int len = zmq_msg_recv(&topic, subscriber, 0);
         
         if (len != -1) {
-            // 收到消息，检查是否是 hashblock
             if (strncmp((char*)zmq_msg_data(&topic), "hashblock", 9) == 0) {
-                // 读取后续的数据帧 (BlockHash)
                 zmq_msg_t payload;
                 zmq_msg_init(&payload);
                 zmq_msg_recv(&payload, subscriber, 0);
                 
                 log_info(">>> ZMQ: New Block Detected! Updating immediately. <<<");
-                bitcoin_update_template(true); // 强制 Clean Jobs
+                bitcoin_update_template(true);
                 
                 zmq_msg_close(&payload);
             }

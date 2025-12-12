@@ -1,12 +1,8 @@
-name: Build and Publish Docker Image
+name: Build and Publish Docker Image (Manual)
 
 on:
-  push:
-    branches: [ "main" ]
-    # 当打上 v* 标签时也触发 (例如 v1.0.0)
-    tags: [ 'v*.*.*' ]
-  pull_request:
-    branches: [ "main" ]
+  # 仅使用 workflow_dispatch 实现手动触发，不包含任何输入参数
+  workflow_dispatch:
 
 env:
   # 使用 ghcr.io 作为镜像仓库
@@ -37,14 +33,15 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # 仅生成 'latest' 标签，因为没有事件和输入参数来提供版本信息
           tags: |
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
-            type=ref,event=tag
+            type=raw,value=latest 
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
-          push: ${{ github.event_name != 'pull_request' }}
+          # 对于手动触发，通常总是希望推送到仓库
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

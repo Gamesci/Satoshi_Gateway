@@ -8,7 +8,7 @@
 #include "bitcoin.h"
 #include "stratum.h"
 #include "utils.h"
-#include "zmq_listener.h" // 新增
+#include "zmq_listener.h"
 
 volatile sig_atomic_t g_block_notify = 0;
 void handle_signal(int sig) { if(sig == SIGUSR1) g_block_notify = 1; }
@@ -27,7 +27,6 @@ int main(int argc, char *argv[]) {
     if(bitcoin_init() != 0) return 1;
     if(stratum_start_thread() != 0) return 1;
     
-    // 启动 ZMQ 监听
     zmq_listener_start();
     
     log_info("Gateway ready on port %d", g_config.stratum_port);

@@ -8,14 +8,11 @@
 #include "bitcoin.h"
 #include "config.h"
 #include "stratum.h"
-#include "utils.h"
+#include "utils.h" // 包含 address_to_script 声明
 #include "sha256.h"
 
 static Template g_current_tmpl = {0};
 static pthread_mutex_t g_tmpl_lock = PTHREAD_MUTEX_INITIALIZER;
-
-// 前置声明
-void address_to_script(const char *addr, char *script_hex);
 
 struct MemoryStruct { char *memory; size_t size; };
 static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp) {
@@ -120,7 +117,6 @@ bool bitcoin_get_current_job_copy(Template *out) {
 }
 
 void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, char *c2, const char *default_witness) {
-    // Part 1
     sprintf(c1, "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff");
     uint8_t h_le[4];
     h_le[0]=height&0xff; h_le[1]=(height>>8)&0xff; h_le[2]=(height>>16)&0xff; h_le[3]=(height>>24)&0xff;
@@ -132,7 +128,6 @@ void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, c
     sprintf(script_sig, "2003%02x%02x%02x14%s", h_le[0], h_le[1], h_le[2], tag_hex);
     strcat(c1, script_sig);
 
-    // Part 2
     sprintf(c2, "ffffffff02"); 
     char val_hex[17];
     sprintf(val_hex, "%016lx", value);
@@ -303,9 +298,6 @@ int bitcoin_reconstruct_and_submit(const char *job_id, const char *full_extranon
     return ret;
 }
 
-// -------------------------------------------------------------------
-// 核心逻辑: 宽容的 GBT 解析
-// -------------------------------------------------------------------
 void bitcoin_update_template(bool clean_jobs) {
     log_info("Fetching Block Template...");
     json_t *rules = json_array();
@@ -338,9 +330,8 @@ void bitcoin_update_template(bool clean_jobs) {
         return;
     }
     
-    // 移除强制的 Missing Fields 检查，改为尝试读取
+    // 宽容解析逻辑
     pthread_mutex_lock(&g_tmpl_lock);
-    
     bitcoin_cleanup_template(&g_current_tmpl);
     
     static int job_counter = 0;
@@ -349,7 +340,7 @@ void bitcoin_update_template(bool clean_jobs) {
     
     g_current_tmpl.height = json_integer_value(json_object_get(res, "height"));
     
-    // Version 处理 (兼容 Libre Relay 可能不返回 versionHex)
+    // Version: 优先使用 versionHex，缺失则回退到 version int
     json_t *j_ver_hex = json_object_get(res, "versionHex");
     g_current_tmpl.version_int = json_integer_value(json_object_get(res, "version"));
     
@@ -357,19 +348,18 @@ void bitcoin_update_template(bool clean_jobs) {
         const char *ver_hex = json_string_value(j_ver_hex);
         strncpy(g_current_tmpl.version, ver_hex, 8);
     } else {
-        // 如果没有 Hex，用整数生成 BE Hex
+        // Fallback: int to BE hex
         sprintf(g_current_tmpl.version, "%08x", swap_uint32(g_current_tmpl.version_int));
     }
     
     const char *bits = json_string_value(json_object_get(res, "bits"));
     if(bits) strncpy(g_current_tmpl.nbits, bits, 8);
-    else strcpy(g_current_tmpl.nbits, "1d00ffff"); // Fallback
+    else strcpy(g_current_tmpl.nbits, "1d00ffff");
     g_current_tmpl.nbits_int = strtoul(g_current_tmpl.nbits, NULL, 16);
     
     g_current_tmpl.ntime_int = json_integer_value(json_object_get(res, "curtime"));
     sprintf(g_current_tmpl.ntime, "%08x", swap_uint32(g_current_tmpl.ntime_int));
     
-    // PrevHash 处理
     const char *prev = json_string_value(json_object_get(res, "previousblockhash"));
     if(prev) {
         uint8_t prev_bin[32];
@@ -377,7 +367,6 @@ void bitcoin_update_template(bool clean_jobs) {
         reverse_bytes(prev_bin, 32); 
         bin2hex(prev_bin, 32, g_current_tmpl.prev_hash);
     } else {
-        // 如果连 PrevHash 都没有，可能是创世块或者严重错误
         log_error("PrevHash missing! Check Node.");
         memset(g_current_tmpl.prev_hash, '0', 64);
     }

@@ -143,11 +143,6 @@ bool bitcoin_get_latest_job(Template *out) {
 // 声明 utils.c 中的函数
 void address_to_script(const char *addr, char *script_hex); 
 
-// 构建 Coinbase (完全对齐 BlockBuilder/CKPool 结构):
-// 1. Version 1 (01000000)
-// 2. Height First (BIP34)
-// 3. ExtraNonce Push Second (Coinb1 结束)
-// 4. Tag Third (Coinb2 开头)
 void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, char *c2, const char *default_witness) {
     int tag_len = strlen(msg);
     if(tag_len > 60) tag_len = 60; // 截断保护
@@ -161,49 +156,33 @@ void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, c
     int h_len = 0;
     uint32_t temp_h = height;
     
-    // 1. 最小化小端序编码
     do {
         h_enc[h_len++] = temp_h & 0xff;
         temp_h >>= 8;
     } while (temp_h > 0);
 
-    // 2. 处理符号位
     if (h_enc[h_len - 1] & 0x80) {
         h_enc[h_len++] = 0x00;
     }
 
-    // 计算 Tag Push Op 长度
     int tag_push_len = (tag_len > 0) ? ((tag_len >= 76) ? 2 : 1) : 0;
-
-    // ScriptSig 结构: [Height] + [EN_Push] + [EN] + [Tag]
-    // 注意：Pool Tag 将会被放在 Coinb2 中，但它仍然是 ScriptSig 的一部分，所以长度要算进去
     int total_len = (1 + h_len) + 1 + en_total + tag_push_len + tag_len;
     
-    // BIP34 限制 (100 bytes)
     if (total_len > 100) {
         tag_len = 0;
         tag_push_len = 0;
         total_len = (1 + h_len) + 1 + en_total; 
     }
     
-    // --- Coinb1 ---
-    // Header - 强制使用 Version 1 (01000000)
     sprintf(c1, "010000000100000000000000000000000000000000000000000000000000000000ffffffff");
     
-    // Script Length (VarInt)
     char len_hex[10]; sprintf(len_hex, "%02x", total_len); strcat(c1, len_hex);
     
-    // 1. BIP34 Height (动态写入)
-    sprintf(c1 + strlen(c1), "%02x", h_len); // Push Opcode
+    sprintf(c1 + strlen(c1), "%02x", h_len); 
     for(int i=0; i<h_len; i++) sprintf(c1 + strlen(c1), "%02x", h_enc[i]);
     
-    // 2. ExtraNonce Push Op (Coinb1 结尾)
-    // 矿机会在后面追加 EN1 + EN2
     sprintf(c1 + strlen(c1), "%02x", en_total); 
     
-    // --- Coinb2 ---
-    // Coinb2 紧随 ExtraNonce 之后
-    // 3. Pool Tag (放在 Coinb2 开头)
     c2[0] = '\0';
     if (tag_len > 0) {
         if (tag_len >= 76) sprintf(c2, "4c%02x", tag_len);
@@ -212,15 +191,12 @@ void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, c
         for(int i=0; i<tag_len; i++) sprintf(c2 + strlen(c2), "%02x", (unsigned char)msg[i]);
     }
     
-    // 4. Sequence
     strcat(c2, "ffffffff"); 
     
-    // Outputs
     int output_count = (default_witness && strlen(default_witness) > 0) ? 2 : 1;
     char out_cnt_hex[4]; sprintf(out_cnt_hex, "%02x", output_count);
     strcat(c2, out_cnt_hex);
 
-    // Payout
     char val_hex[17]; sprintf(val_hex, "%016lx", value);
     uint8_t val_bin[8]; hex2bin(val_hex, val_bin, 8); reverse_bytes(val_bin, 8);
     char val_le[17]; bin2hex(val_bin, 8, val_le); strcat(c2, val_le);
@@ -231,14 +207,12 @@ void build_coinbase(uint32_t height, int64_t value, const char *msg, char *c1, c
     char sl_hex[10]; sprintf(sl_hex, "%02x", (int)strlen(script_pub)/2);
     strcat(c2, sl_hex); strcat(c2, script_pub);
 
-    // Witness Commitment (Output 2)
     if (output_count > 1) {
-        strcat(c2, "0000000000000000"); // Value 0
+        strcat(c2, "0000000000000000"); 
         char w_len_hex[10]; sprintf(w_len_hex, "%02x", (int)strlen(default_witness)/2);
         strcat(c2, w_len_hex); strcat(c2, default_witness);
     }
     
-    // Locktime
     strcat(c2, "00000000");
 }
 
@@ -254,7 +228,10 @@ void calculate_merkle_branch(json_t *txs, Template *tmpl) {
         if(!tid || !dat) { tmpl->tx_hexs[i] = strdup(""); memset(leaves[i+1], 0, 32); continue; }
         
         tmpl->tx_hexs[i] = strdup(dat);
+        
+        // [FIX] 必须反转字节序! RPC返回的是Big Endian, Merkle Tree计算需要Little Endian
         hex2bin(tid, leaves[i+1], 32); 
+        reverse_bytes(leaves[i+1], 32); 
     }
     
     int level = total; int idx = 0;
@@ -288,7 +265,8 @@ int bitcoin_submit_block(const char *hex_data) {
     return success;
 }
 
-int bitcoin_validate_and_submit(const char *job_id, const char *full_extranonce, const char *ntime, uint32_t nonce, uint32_t version_bits) {
+// [FIX] 增加难度验证逻辑
+int bitcoin_validate_and_submit(const char *job_id, const char *full_extranonce, const char *ntime, uint32_t nonce, uint32_t version_bits, double diff) {
     pthread_mutex_lock(&g_tmpl_lock);
     
     Template *job = NULL;
@@ -333,8 +311,17 @@ int bitcoin_validate_and_submit(const char *job_id, const char *full_extranonce,
     
     int result = 0; 
 
-    if (h_be[0] == 0 && h_be[1] == 0 && h_be[2] == 0 && h_be[3] == 0) {
-         result = 1;
+    // [FIX] 验证 Share 难度
+    // 简化验证：取Hash高64位进行比较。Diff 1 对应的 target 高64位约为 0x00000000FFFF0000
+    // 警告：这种转换依赖大端序数据在当前机器上的表示，以下实现假设 h_be 内存布局正确
+    uint64_t hash_top = 0;
+    for(int k=0; k<8; k++) hash_top = (hash_top << 8) | h_be[k];
+
+    uint64_t target_top = 0x00000000FFFF0000ULL;
+    if(diff >= 1.0) target_top = (uint64_t)(target_top / diff);
+
+    if (hash_top <= target_top) {
+         result = 1; // 达到 Share 难度
     }
 
     uint8_t target[32];
@@ -391,7 +378,10 @@ void bitcoin_update_template(bool force_clean) {
     Template *curr = &g_jobs[g_job_head];
     bitcoin_free_job(curr);
     
-    static int jid = 0; snprintf(curr->job_id, 32, "%x", ++jid);
+    static int jid = 0; 
+    // [FIX] Job ID 包含时间戳，防止重启冲突
+    snprintf(curr->job_id, 32, "%x%x", (uint32_t)time(NULL), ++jid);
+    
     curr->valid = true; curr->clean_jobs = clean;
     curr->height = json_integer_value(json_object_get(res, "height"));
     

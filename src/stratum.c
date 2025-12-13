@@ -17,7 +17,7 @@ static Client g_clients[MAX_CLIENTS];
 static pthread_mutex_t g_clients_lock = PTHREAD_MUTEX_INITIALIZER;
 
 #define SHARE_CACHE_SIZE 2048
-typedef struct { char key[128]; } ShareEntry;
+typedef struct { char key[256]; } ShareEntry; // 扩大缓存键值大小
 static ShareEntry g_share_cache[SHARE_CACHE_SIZE];
 static int g_share_head = 0;
 static pthread_mutex_t g_cache_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -128,17 +128,25 @@ void stratum_send_mining_notify(int sock, Template *tmpl) {
     json_decref(r);
 }
 
+// [FIX] 广播优化：移除全局锁内的网络 IO，防止死锁
 void stratum_broadcast_job(Template *tmpl) {
+    int sockets[MAX_CLIENTS];
+    int count = 0;
+
     pthread_mutex_lock(&g_clients_lock); 
-    int c=0;
     for(int i=0; i<MAX_CLIENTS; i++) { 
         if(g_clients[i].active && g_clients[i].is_authorized) { 
-            stratum_send_mining_notify(g_clients[i].sock, tmpl); 
-            c++; 
+            sockets[count++] = g_clients[i].sock;
         } 
     }
     pthread_mutex_unlock(&g_clients_lock);
-    if(c>0) log_info("Broadcast Job %s to %d miners", tmpl->job_id, c);
+    
+    // 在锁外发送
+    for(int i=0; i<count; i++) {
+        stratum_send_mining_notify(sockets[i], tmpl);
+    }
+    
+    if(count > 0) log_info("Broadcast Job %s to %d miners", tmpl->job_id, count);
 }
 
 void *client_worker(void *arg) {
@@ -224,8 +232,12 @@ void *client_worker(void *arg) {
                         const char *en2 = json_string_value(json_array_get(p, 2));
                         const char *nt = json_string_value(json_array_get(p, 3));
                         const char *nh = json_string_value(json_array_get(p, 4));
-                        char dk[128]; 
-                        snprintf(dk, sizeof(dk), "%s_%s_%s", jid, en2, nh);
+                        const char *vh = ""; 
+                        if(json_array_size(p)>=6) vh = json_string_value(json_array_get(p, 5));
+
+                        char dk[256]; 
+                        // [FIX] 增加 ntime (nt) 和 version (vh) 到重复检查 Key 中
+                        snprintf(dk, sizeof(dk), "%s_%s_%s_%s_%s", jid, en2, nh, nt, vh ? vh : "0");
                         
                         if(is_duplicate_share(dk)) {
                             log_info("Dup Share: %s", dk);
@@ -236,21 +248,20 @@ void *client_worker(void *arg) {
                             json_object_set_new(res, "error", e);
                         } else {
                             uint32_t vm = 0; 
-                            if(json_array_size(p)>=6) { 
-                                const char *vh=json_string_value(json_array_get(p, 5)); 
-                                if(vh) vm=strtoul(vh, NULL, 16); 
-                            }
+                            if(vh && strlen(vh)>0) vm=strtoul(vh, NULL, 16);
+                            
                             uint32_t n = (uint32_t)strtoul(nh, NULL, 16);
                             char full[64]; 
                             snprintf(full, sizeof(full), "%s%s", c->extranonce1_hex, en2);
                             
-                            int ret = bitcoin_validate_and_submit(jid, full, nt, n, vm);
+                            // [FIX] 传入 c->current_diff 进行难度验证
+                            int ret = bitcoin_validate_and_submit(jid, full, nt, n, vm, c->current_diff);
                             
                             if(ret==0) {
                                 json_object_set_new(res, "result", json_false());
                                 json_t *e=json_array(); 
                                 json_array_append_new(e, json_integer(21)); 
-                                json_array_append_new(e, json_string("Stale")); 
+                                json_array_append_new(e, json_string("Stale or Low Difficulty")); 
                                 json_object_set_new(res, "error", e);
                             } else {
                                 json_object_set_new(res, "result", json_true()); 

@@ -33,6 +33,8 @@ typedef struct {
 int bitcoin_init();
 void bitcoin_update_template(bool force_clean);
 bool bitcoin_get_latest_job(Template *out);
-int bitcoin_validate_and_submit(const char *job_id, const char *full_extranonce, const char *ntime, uint32_t nonce, uint32_t version_bits);
+
+// [FIX] 增加 diff 参数用于验证 Share 难度
+int bitcoin_validate_and_submit(const char *job_id, const char *full_extranonce, const char *ntime, uint32_t nonce, uint32_t version_bits, double diff);
 
 #endif

@@ -8,7 +8,7 @@
   "listen_port": 3333,
   "poll_interval": "30",
   "diff_asic": 1024,
-  "vardiff_target_shares_min": 20,
+  "vardiff_target_shares_min": 10,
   "extranonce2_size": 8,
   "version_mask": "1fffe000"
 }

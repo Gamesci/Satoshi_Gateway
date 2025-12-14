@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <errno.h>
+#include <math.h>
 
 #include "bitcoin.h"
 #include "config.h"
@@ -29,17 +30,14 @@ static int cmp256_be(const uint8_t a[32], const uint8_t b[32]) {
 }
 
 static void nbits_to_target_be(uint32_t nbits, uint8_t target_be[32]) {
-    // Bitcoin "compact" format -> 256-bit target (big-endian)
     memset(target_be, 0, 32);
     uint32_t exp = nbits >> 24;
     uint32_t mant = nbits & 0x007fffffU; // ignore sign bit
     if (exp == 0) return;
 
     // target = mantissa * 2^(8*(exp-3))
-    // mantissa is 3 bytes
     if (exp <= 3) {
         mant >>= 8 * (3 - exp);
-        // place at end (big-endian)
         target_be[29] = (mant >> 16) & 0xff;
         target_be[30] = (mant >> 8) & 0xff;
         target_be[31] = mant & 0xff;
@@ -58,25 +56,12 @@ static void nbits_to_target_be(uint32_t nbits, uint8_t target_be[32]) {
 // diff1 target (Bitcoin) = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
 static void diff1_target_be(uint8_t out[32]) {
     memset(out, 0, 32);
-    out[4] = 0x00;
-    out[5] = 0x00;
+    // Big-endian placement:
+    // 00 00 00 00 FF FF 00 00 00 ... 00
+    out[4] = 0xff;
+    out[5] = 0xff;
     out[6] = 0x00;
     out[7] = 0x00;
-    out[8] = 0xff;
-    out[9] = 0xff;
-    // Wait: correct diff1 target has 0x00000000FFFF0000 at bytes 4..7 and 8..?
-    // Let's set exactly:
-    // 00000000 ffff0000 00000000 ...
-    memset(out, 0, 32);
-    out[4] = 0x00;
-    out[5] = 0x00;
-    out[6] = 0x00;
-    out[7] = 0x00;
-    out[8] = 0xff;
-    out[9] = 0xff;
-    out[10] = 0x00;
-    out[11] = 0x00;
-    // remaining already 0
 }
 
 // Integer division of 256-bit big-endian by uint32 divisor (div>0)
@@ -89,20 +74,128 @@ static void div256_u32_be(uint8_t x[32], uint32_t div) {
     }
 }
 
+// Multiply 256-bit big-endian by uint32, keep low 256 bits. Returns carry (overflow) discarded.
+static void mul256_u32_be(uint8_t x[32], uint32_t mul) {
+    uint64_t carry = 0;
+    for (int i = 31; i >= 0; i--) {
+        uint64_t prod = (uint64_t)x[i] * (uint64_t)mul + carry;
+        x[i] = (uint8_t)(prod & 0xff);
+        carry = prod >> 8;
+    }
+}
+
+// x = x * 2^k (k in [0,255]) for 256-bit BE, overflow discarded.
+static void shl256_be(uint8_t x[32], unsigned k) {
+    if (k == 0) return;
+    unsigned bytes = k / 8;
+    unsigned bits  = k % 8;
+
+    if (bytes >= 32) {
+        memset(x, 0, 32);
+        return;
+    }
+
+    if (bytes > 0) {
+        for (int i = 0; i < 32; i++) {
+            int src = i + (int)bytes;
+            x[i] = (src < 32) ? x[src] : 0;
+        }
+    }
+
+    if (bits == 0) return;
+
+    uint8_t prev = 0;
+    for (int i = 31; i >= 0; i--) {
+        uint8_t cur = x[i];
+        x[i] = (uint8_t)((cur << bits) | (prev >> (8 - bits)));
+        prev = cur;
+    }
+}
+
+// Compare 256-bit BE to zero
+static bool is_zero256_be(const uint8_t x[32]) {
+    for (int i = 0; i < 32; i++) if (x[i] != 0) return false;
+    return true;
+}
+
+// Divide 256-bit BE integer by 64-bit BE-ish? We'll implement long division by 64-bit divisor in base 256.
+static void div256_u64_be(uint8_t x[32], uint64_t div) {
+    if (div == 0) { memset(x, 0, 32); return; }
+    __uint128_t rem = 0;
+    for (int i = 0; i < 32; i++) {
+        __uint128_t cur = (rem << 8) | x[i];
+        x[i] = (uint8_t)(cur / div);
+        rem = cur % div;
+    }
+}
+
+// Convert diff -> target using high-precision approach:
+// target = diff1_target / diff
+// We implement: represent diff as mantissa * 2^exp (binary), then do integer division by mantissa and shift.
 static bool diff_to_target_be(double diff, uint8_t target_be[32]) {
-    if (!(diff > 0.0)) return false;
-    // Avoid float heavy math: clamp to reasonable range and approximate divisor by uint32.
-    // This is still deterministic for integer diffs (your vardiff uses powers of two).
-    // For non-integer diff: use rounded divisor.
-    double d = diff;
-    if (d < 1.0) d = 1.0;
+    if (!(diff > 0.0) || !isfinite(diff)) return false;
 
-    // Convert to uint32 divisor (rounded). This keeps correct for typical pool diffs (integer).
-    uint32_t div = (uint32_t)(d + 0.5);
-    if (div == 0) div = 1;
+    // Clamp: Stratum diff should not be <1 in typical pools; allow but clamp to 1 to avoid target > diff1.
+    if (diff < 1.0) diff = 1.0;
 
-    diff1_target_be(target_be);
-    div256_u32_be(target_be, div);
+    // Decompose diff = m * 2^e, with m in [0.5,1)
+    int e2 = 0;
+    double m = frexp(diff, &e2); // diff = m * 2^e2
+
+    // Scale mantissa to 64-bit integer for division
+    // mant = round(m * 2^64). Since m<1, mant fits in 64 bits.
+    long double md = (long double)m;
+    long double scaled = md * (long double)18446744073709551616.0L; // 2^64
+    uint64_t mant = (uint64_t)(scaled + 0.5L);
+    if (mant == 0) mant = 1;
+
+    // target = diff1 / (mant * 2^(e2-64))
+    // = (diff1 * 2^(64 - e2)) / mant
+    uint8_t t[32];
+    diff1_target_be(t);
+
+    // Apply shift left by (64 - e2) if positive, else shift right by (e2 - 64) using division by 2^k.
+    int shift = 64 - e2;
+    if (shift > 0) {
+        if (shift > 255) shift = 255;
+        shl256_be(t, (unsigned)shift);
+    } else if (shift < 0) {
+        // right shift by -shift: repeated div by 2^k = div by 2^(-shift)
+        int r = -shift;
+        if (r > 255) { memset(t, 0, 32); }
+        else {
+            // divide by 2^r: do it byte-wise with carry
+            unsigned bytes = (unsigned)(r / 8);
+            unsigned bits  = (unsigned)(r % 8);
+            if (bytes >= 32) memset(t, 0, 32);
+            else {
+                if (bytes > 0) {
+                    for (int i = 31; i >= 0; i--) {
+                        int src = i - (int)bytes;
+                        t[i] = (src >= 0) ? t[src] : 0;
+                    }
+                }
+                if (bits) {
+                    uint8_t carry = 0;
+                    for (int i = 0; i < 32; i++) {
+                        uint8_t cur = t[i];
+                        t[i] = (uint8_t)((cur >> bits) | (carry << (8 - bits)));
+                        carry = (uint8_t)(cur & ((1u << bits) - 1u));
+                    }
+                }
+            }
+        }
+    }
+
+    // Now divide by mant (uint64). This is approximate-but-very-close mapping from double diff.
+    // Good enough for share validation; most pools use integer or power-of-two diffs, where this is exact.
+    div256_u64_be(t, mant);
+
+    if (is_zero256_be(t)) {
+        // Avoid zero target
+        t[31] = 1;
+    }
+    memcpy(target_be, t, 32);
     return true;
 }
 
@@ -266,10 +359,8 @@ void bitcoin_free_job(Template *t) {
 }
 
 static bool template_deep_copy_notify(Template *dst, const Template *src) {
-    // copy only fields needed for notify + minimal metadata
     *dst = *src;
 
-    // Deep copy merkle branch
     dst->merkle_branch = NULL;
     if (src->merkle_count > 0) {
         dst->merkle_branch = calloc(src->merkle_count, sizeof(char*));
@@ -279,7 +370,6 @@ static bool template_deep_copy_notify(Template *dst, const Template *src) {
             if (!dst->merkle_branch[i]) return false;
         }
     }
-    // For notify snapshot we do NOT copy tx_hexs/txids_le (not needed)
     dst->tx_hexs = NULL;
     dst->txids_le = NULL;
     dst->tx_count = 0;
@@ -334,22 +424,13 @@ static bool build_coinbase_hex(uint32_t height, int64_t value_sats,
                                int extranonce2_size,
                                char *coinb1_hex, size_t coinb1_cap,
                                char *coinb2_hex, size_t coinb2_cap) {
-    // Build coinbase tx:
-    // version(4) + marker/flag(optional) not used here; we construct a legacy tx with optional witness commitment output
-    // input count=1
-    // prevout = 32*00 + 0xffffffff
-    // scriptSig = push(BIP34 height) + push(extranonce placeholder) + push(tag)
-    // sequence = 0xffffffff
-    // outputs: (1 or 2) including witness commitment OP_RETURN if provided by GBT
-    // locktime = 0
-
     if (extranonce1_size <= 0 || extranonce2_size <= 0) return false;
     if (extranonce1_size + extranonce2_size > 64) return false;
 
     uint8_t scriptSig[256];
     size_t sp = 0;
 
-    // BIP34 height encoding: minimal little-endian with sign bit rule
+    // BIP34 height encoding
     uint8_t h_enc[8];
     size_t h_len = 0;
     uint32_t th = height;
@@ -362,25 +443,20 @@ static bool build_coinbase_hex(uint32_t height, int64_t value_sats,
     sp += write_pushdata(scriptSig + sp, sizeof(scriptSig) - sp, h_enc, h_len);
     if (sp == 0) return false;
 
-    // Extranonce placeholder bytes (en1+en2) will be split between coinb1/coinb2:
-    // We put a push of total extranonce bytes, but only place EN1 in coinb1 and EN2 will be inserted by miner after coinb1.
     uint8_t en_placeholder[64];
     memset(en_placeholder, 0, (size_t)(extranonce1_size + extranonce2_size));
     size_t en_tot = (size_t)(extranonce1_size + extranonce2_size);
     size_t w = write_pushdata(scriptSig + sp, sizeof(scriptSig) - sp, en_placeholder, en_tot);
     if (w == 0) return false;
-    // We will split inside this push: first extranonce1_size bytes in coinb1,
-    // remaining extranonce2_size bytes belong to miner insertion -> so we cut coinb1/coinb2 around it.
-    // To do that, we need to know where the pushed data begins.
+
     size_t en_push_hdr = 0;
     if (en_tot <= 75) en_push_hdr = 1;
     else if (en_tot <= 255) en_push_hdr = 2;
     else en_push_hdr = 3;
 
-    size_t en_data_offset_in_script = sp + en_push_hdr; // start of placeholder bytes
+    size_t en_data_offset_in_script = sp + en_push_hdr;
     sp += w;
 
-    // Pool tag (optional, truncated)
     uint8_t tagbuf[64];
     size_t taglen = 0;
     if (tag && tag[0]) {
@@ -392,63 +468,39 @@ static bool build_coinbase_hex(uint32_t height, int64_t value_sats,
         sp += w2;
     }
 
-    // Now build tx bytes up to just before extranonce2 insertion point.
-    // coinb1 = tx_prefix + scriptSig bytes up to EN2 start
-    // coinb2 = remaining scriptSig bytes after EN2 + sequence + outputs + locktime
-
-    // tx fixed parts
     uint8_t tx_prefix[512];
     size_t tp = 0;
 
-    // version
     put_le32(tx_prefix + tp, 1); tp += 4;
-
-    // input count (1)
     tx_prefix[tp++] = 0x01;
-
-    // prevout hash (32*0) + index (0xffffffff)
     memset(tx_prefix + tp, 0, 32); tp += 32;
     put_le32(tx_prefix + tp, 0xffffffffU); tp += 4;
 
-    // scriptSig length (varint, sp bytes)
-    if (sp < 0xfd) {
-        tx_prefix[tp++] = (uint8_t)sp;
-    } else {
-        return false; // scriptSig too big for our constraints
-    }
-
-    // Now we must split scriptSig into:
-    // partA: scriptSig[0 .. en_data_offset_in_script + extranonce1_size)
-    // miner inserts extranonce2_size bytes
-    // partB: rest of scriptSig after (en_data_offset_in_script + extranonce1_size + extranonce2_size)
+    if (sp < 0xfd) tx_prefix[tp++] = (uint8_t)sp;
+    else return false;
 
     size_t en1_end = en_data_offset_in_script + (size_t)extranonce1_size;
     size_t en2_end = en1_end + (size_t)extranonce2_size;
     if (en2_end > sp) return false;
 
-    // Compose coinb1 bytes
     uint8_t coinb1_bin[2048];
     size_t c1 = 0;
     if (sizeof(coinb1_bin) < tp + en1_end) return false;
     memcpy(coinb1_bin + c1, tx_prefix, tp); c1 += tp;
     memcpy(coinb1_bin + c1, scriptSig, en1_end); c1 += en1_end;
 
-    // coinb2 bytes begin with remaining scriptSig after EN2
     uint8_t coinb2_bin[4096];
     size_t c2 = 0;
     memcpy(coinb2_bin + c2, scriptSig + en2_end, sp - en2_end); c2 += (sp - en2_end);
 
-    // sequence
     put_le32(coinb2_bin + c2, 0xffffffffU); c2 += 4;
 
-    // outputs count
     int outputs = 1;
     bool has_wit_commit = (default_witness_commitment_hex && strlen(default_witness_commitment_hex) > 0);
     if (has_wit_commit) outputs = 2;
 
     coinb2_bin[c2++] = (uint8_t)outputs;
 
-    // output 0: value + scriptPubKey(payout)
     put_le64(coinb2_bin + c2, (uint64_t)value_sats); c2 += 8;
 
     char script_hex[256];
@@ -462,9 +514,7 @@ static bool build_coinbase_hex(uint32_t height, int64_t value_sats,
     if (!hex2bin_checked(script_hex, script_bin, script_len)) return false;
     memcpy(coinb2_bin + c2, script_bin, script_len); c2 += script_len;
 
-    // optional witness commitment output (OP_RETURN with commitment script provided by GBT)
     if (has_wit_commit) {
-        // value = 0
         put_le64(coinb2_bin + c2, 0); c2 += 8;
 
         size_t wlen = strlen(default_witness_commitment_hex) / 2;
@@ -476,43 +526,29 @@ static bool build_coinbase_hex(uint32_t height, int64_t value_sats,
         memcpy(coinb2_bin + c2, wbin, wlen); c2 += wlen;
     }
 
-    // locktime
     put_le32(coinb2_bin + c2, 0); c2 += 4;
 
-    // Finally convert to hex
     if (!bin2hex_safe(coinb1_bin, c1, coinb1_hex, coinb1_cap)) return false;
     if (!bin2hex_safe(coinb2_bin, c2, coinb2_hex, coinb2_cap)) return false;
     return true;
 }
 
 // ---------- merkle branch generation ----------
-// We store txids (non-coinbase) as LE bytes.
-// For stratum, merkle_branch is list of siblings (LE hex) along coinbase path.
 static bool calculate_merkle_branch_from_txids(const uint8_t (*txids_le)[32], size_t tx_count,
                                                char ***out_branch, size_t *out_count) {
     *out_branch = NULL;
     *out_count = 0;
 
-    // Total leaves = 1 coinbase + tx_count
     size_t total = 1 + tx_count;
     if (total == 1) return true;
 
-    // We'll build levels of hashes (LE bytes). coinbase leaf is unknown at template time,
-    // but siblings for coinbase path depend only on other txids and tree structure:
-    // At each level, sibling of position 0 is position 1 hash of that level.
-    // However, when tx_count == 0, no siblings.
-
-    // Level0 nodes: [COINBASE_PLACEHOLDER, txid1, txid2, ...]
     uint8_t *level = calloc(total, 32);
     if (!level) return false;
 
-    // Set coinbase placeholder to 0x00..00 (doesn't affect sibling extraction)
-    // Fill other txids
     for (size_t i = 0; i < tx_count; i++) {
         memcpy(level + (i + 1) * 32, txids_le[i], 32);
     }
 
-    // Branch will have up to ceil(log2(total)) entries
     char **branch = calloc(64, sizeof(char*));
     if (!branch) { free(level); return false; }
     size_t bcount = 0;
@@ -521,20 +557,26 @@ static bool calculate_merkle_branch_from_txids(const uint8_t (*txids_le)[32], si
     uint8_t *next = NULL;
 
     while (level_count > 1) {
-        // sibling for coinbase path at this level:
-        // if level_count>1, sibling index for 0 is 1, but if missing, it's 0 itself.
         const uint8_t *sib = (level_count > 1) ? (level + 1 * 32) : (level + 0);
-        // In case total==1 this loop doesn't run.
         char hex[65];
-        if (!bin2hex_safe(sib, 32, hex, sizeof(hex))) { /* impossible */ }
+        (void)bin2hex_safe(sib, 32, hex, sizeof(hex));
         branch[bcount] = strdup(hex);
-        if (!branch[bcount]) { free(level); for (size_t k=0;k<bcount;k++) free(branch[k]); free(branch); return false; }
+        if (!branch[bcount]) {
+            free(level);
+            for (size_t k = 0; k < bcount; k++) free(branch[k]);
+            free(branch);
+            return false;
+        }
         bcount++;
 
-        // Build next level
         size_t pairs = (level_count + 1) / 2;
         next = calloc(pairs, 32);
-        if (!next) { free(level); for (size_t k=0;k<bcount;k++) free(branch[k]); free(branch); return false; }
+        if (!next) {
+            free(level);
+            for (size_t k = 0; k < bcount; k++) free(branch[k]);
+            free(branch);
+            return false;
+        }
 
         for (size_t i = 0; i < pairs; i++) {
             const uint8_t *L = level + (2 * i) * 32;
@@ -551,15 +593,17 @@ static bool calculate_merkle_branch_from_txids(const uint8_t (*txids_le)[32], si
         next = NULL;
         level_count = pairs;
 
-        // safety bound
         if (bcount >= 64) break;
     }
 
     free(level);
 
-    // shrink
     char **final = calloc(bcount, sizeof(char*));
-    if (!final && bcount > 0) { for (size_t k=0;k<bcount;k++) free(branch[k]); free(branch); return false; }
+    if (!final && bcount > 0) {
+        for (size_t k = 0; k < bcount; k++) free(branch[k]);
+        free(branch);
+        return false;
+    }
     for (size_t i = 0; i < bcount; i++) final[i] = branch[i];
     free(branch);
 
@@ -600,8 +644,8 @@ int bitcoin_validate_and_submit(const char *job_id,
                                 double diff) {
     if (!job_id || !full_extranonce_hex || !ntime_hex) return 0;
     if (!is_hex_len(ntime_hex, 8)) return 0;
-    // extranonce length must match en1+en2 in hex
-    size_t expect_en_hex = (size_t)(4 + g_config.extranonce2_size) * 2; // en1 fixed 4 bytes in this design
+
+    size_t expect_en_hex = (size_t)(4 + g_config.extranonce2_size) * 2;
     if (strlen(full_extranonce_hex) != expect_en_hex) return 0;
 
     pthread_mutex_lock(&g_tmpl_lock);
@@ -618,7 +662,7 @@ int bitcoin_validate_and_submit(const char *job_id,
         return 0;
     }
 
-    // Build coinbase hex (coinb1 + extranonce + coinb2)
+    // Build coinbase hex
     size_t coin_hex_len = strlen(job->coinb1) + strlen(full_extranonce_hex) + strlen(job->coinb2);
     if (coin_hex_len >= 20000) { pthread_mutex_unlock(&g_tmpl_lock); return 0; }
 
@@ -636,11 +680,11 @@ int bitcoin_validate_and_submit(const char *job_id,
         return 0;
     }
 
-    // coinbase txid = sha256d(coinbase_tx_bytes) (little-endian bytes as produced)
+    // coinbase txid (LE bytes)
     uint8_t coinbase_hash_le[32];
     sha256d(coin_bin, coin_bin_len, coinbase_hash_le);
 
-    // Build merkle root: start from coinbase_hash_le, combine with siblings (LE)
+    // merkle root (LE bytes)
     uint8_t root_le[32];
     memcpy(root_le, coinbase_hash_le, 32);
 
@@ -656,7 +700,7 @@ int bitcoin_validate_and_submit(const char *job_id,
         sha256d(cat, 64, root_le);
     }
 
-    // Build header (80 bytes)
+    // Build header (80 bytes, serialized little-endian fields)
     uint8_t head[80];
     memset(head, 0, sizeof(head));
 
@@ -666,30 +710,10 @@ int bitcoin_validate_and_submit(const char *job_id,
     }
     put_le32(head + 0, ver);
 
-    // prev_hash_bin stored as LE bytes (from getblocktemplate previousblockhash reversed)
-    // header expects LE bytes in serialization, so memcpy directly
-    // NOTE: job doesn't store prev_hash_bin in this revised Template, so we reconstruct from prev_hash_stratum?
-    // We kept prev_hash_stratum only for notify. For validation we can derive header prevhash from notify's swapped format:
-    // But easier: store prevhash LE bytes in internal job. We'll do that by embedding it in unused txids_le pointer area is wrong.
-    // So: in this file we store prevhash LE in job->txids_le? No.
-    // Solution: we maintain prevhash LE in coinbase_value field? No.
-    // Instead: we add a static per-job prevhash_le in a private array aligned with g_jobs, but that changes header.
-    // To keep interface minimal: store prevhash LE in coinb2? No.
-    // Practical fix: we add a hidden field by reusing txids_le allocation? Not safe.
-    // Therefore: we must store prevhash LE in Template; it existed in your original code but removed in new header.
-    // We'll keep it by embedding in Template via a local static map keyed by job slot.
-    // For simplicity in this patch: reconstruct prevhash LE from job->prev_hash_stratum by reversing swap32 + reverse_bytes.
-    uint8_t prev_stratum_bin[32];
-    if (!hex2bin_checked(job->prev_hash_stratum, prev_stratum_bin, 32)) {
-        free(coin_bin); free(coin_hex); pthread_mutex_unlock(&g_tmpl_lock);
-        return 0;
-    }
-    // prev_hash_stratum = swap32(prevhash_le)
-    // so prevhash_le = swap32(prev_stratum_bin)
-    swap32_buffer(prev_stratum_bin, 32);
-    memcpy(head + 4, prev_stratum_bin, 32);
+    // prevhash: use stored header-ready LE bytes (no reconstruction hacks)
+    memcpy(head + 4, job->prevhash_le, 32);
 
-    // merkle root in header is LE serialization; our root_le is LE bytes
+    // merkle root: LE bytes
     memcpy(head + 36, root_le, 32);
 
     uint32_t ntime = (uint32_t)strtoul(ntime_hex, NULL, 16);
@@ -697,16 +721,16 @@ int bitcoin_validate_and_submit(const char *job_id,
     put_le32(head + 72, job->nbits_val);
     put_le32(head + 76, nonce);
 
-    // Hash header
+    // Hash header: sha256d -> LE bytes
     uint8_t hash_le[32];
     sha256d(head, 80, hash_le);
 
-    // Convert to BE for comparisons/display
+    // Convert to BE for numeric compare and display
     uint8_t hash_be[32];
     for (int i = 0; i < 32; i++) hash_be[i] = hash_le[31 - i];
 
     char hash_hex[65];
-    bin2hex_safe(hash_be, 32, hash_hex, sizeof(hash_hex));
+    (void)bin2hex_safe(hash_be, 32, hash_hex, sizeof(hash_hex));
 
     // Share target (from diff)
     uint8_t share_target_be[32];
@@ -715,51 +739,44 @@ int bitcoin_validate_and_submit(const char *job_id,
         return 0;
     }
 
-    int accepted = 0;
-    if (cmp256_be(hash_be, share_target_be) <= 0) accepted = 1;
+    int accepted = (cmp256_be(hash_be, share_target_be) <= 0);
 
     // Block target from nbits
     uint8_t block_target_be[32];
     nbits_to_target_be(job->nbits_val, block_target_be);
-
     int is_block = (cmp256_be(hash_be, block_target_be) <= 0);
 
     int result = 0;
     if (!accepted && !is_block) {
-        // low difficulty
-        result = 0;
+        result = 0; // low diff
     } else if (is_block) {
         log_info(">>> BLOCK FOUND! Hash: %s", hash_hex);
 
-        // Build full block hex: header + varint(tx_count) + coinbase + txs
         size_t tx_total = 1 + job->tx_count;
 
-        // estimate
         size_t cap = 2000000;
         char *block_hex = malloc(cap);
         if (!block_hex) {
             free(coin_bin); free(coin_hex); pthread_mutex_unlock(&g_tmpl_lock);
-            return 1; // share accepted but block serialization failed
+            return 1;
         }
 
         size_t pos = 0;
         char head_hex[161];
-        bin2hex_safe(head, 80, head_hex, sizeof(head_hex));
+        (void)bin2hex_safe(head, 80, head_hex, sizeof(head_hex));
         size_t hl = strlen(head_hex);
         memcpy(block_hex + pos, head_hex, hl); pos += hl;
 
         uint8_t vi[9];
         int vl = encode_varint(vi, (uint64_t)tx_total);
         char vi_hex[19];
-        bin2hex_safe(vi, (size_t)vl, vi_hex, sizeof(vi_hex));
+        (void)bin2hex_safe(vi, (size_t)vl, vi_hex, sizeof(vi_hex));
         size_t vil = strlen(vi_hex);
         memcpy(block_hex + pos, vi_hex, vil); pos += vil;
 
-        // coinbase
         size_t cl = strlen(coin_hex);
         memcpy(block_hex + pos, coin_hex, cl); pos += cl;
 
-        // other txs (job->tx_hexs contain full tx hex)
         for (size_t i = 0; i < job->tx_count; i++) {
             size_t tl = strlen(job->tx_hexs[i]);
             if (pos + tl + 1 >= cap) { free(block_hex); block_hex = NULL; break; }
@@ -774,11 +791,10 @@ int bitcoin_validate_and_submit(const char *job_id,
             result = 2;
         } else {
             log_error("Block submission rejected/failed");
-            result = 1; // still count share
+            result = 1;
         }
         free(block_hex);
     } else {
-        // accepted share only
         result = 1;
     }
 
@@ -811,14 +827,14 @@ void bitcoin_update_template(bool force_clean) {
 
     uint8_t prev_be[32];
     if (!hex2bin_checked(prev, prev_be, 32)) { json_decref(resp); return; }
-    // store as LE bytes for internal, and as stratum format = swap32(LE)
+
+    // Header needs prevhash as LE bytes
     uint8_t prev_le[32];
     memcpy(prev_le, prev_be, 32);
     reverse_bytes(prev_le, 32);
 
     bool clean = force_clean;
 
-    // Prepare new Template in local (avoid holding lock during heavy JSON parsing)
     Template tmp;
     template_zero(&tmp);
     tmp.valid = true;
@@ -851,11 +867,14 @@ void bitcoin_update_template(bool force_clean) {
     tmp.curtime_val = (uint32_t)json_integer_value(json_object_get(res, "curtime"));
     snprintf(tmp.ntime_hex, sizeof(tmp.ntime_hex), "%08x", tmp.curtime_val);
 
-    // prev_hash_stratum = hex(swap32(prev_le))
+    // Store prevhash for header
+    memcpy(tmp.prevhash_le, prev_le, 32);
+
+    // prev_hash_stratum = hex(swap32(prev_le)) as your original design
     uint8_t prev_stratum[32];
     memcpy(prev_stratum, prev_le, 32);
     swap32_buffer(prev_stratum, 32);
-    bin2hex_safe(prev_stratum, 32, tmp.prev_hash_stratum, sizeof(tmp.prev_hash_stratum));
+    (void)bin2hex_safe(prev_stratum, 32, tmp.prev_hash_stratum, sizeof(tmp.prev_hash_stratum));
 
     // transactions
     json_t *txs = json_object_get(res, "transactions");
@@ -878,7 +897,6 @@ void bitcoin_update_template(bool force_clean) {
             const char *txid = json_string_value(json_object_get(tx, "txid"));
             const char *data = json_string_value(json_object_get(tx, "data"));
             if (!txid || strlen(txid) != 64 || !data) {
-                // if malformed, fail hard (template must be consistent)
                 bitcoin_free_job(&tmp);
                 json_decref(resp);
                 return;
@@ -893,6 +911,7 @@ void bitcoin_update_template(bool force_clean) {
             uint8_t txid_le[32];
             memcpy(txid_le, txid_be, 32);
             reverse_bytes(txid_le, 32);
+
             memcpy(tmp.txids_le[i], txid_le, 32);
 
             tmp.tx_hexs[i] = strdup(data);
@@ -904,7 +923,6 @@ void bitcoin_update_template(bool force_clean) {
         }
     }
 
-    // build coinb1/coinb2 (en1 fixed 4 bytes, en2 from config)
     const char *dwc = NULL;
     json_t *dw = json_object_get(res, "default_witness_commitment");
     if (dw && json_is_string(dw)) dwc = json_string_value(dw);
@@ -918,7 +936,6 @@ void bitcoin_update_template(bool force_clean) {
         return;
     }
 
-    // compute merkle branch siblings (LE hex)
     if (!calculate_merkle_branch_from_txids((const uint8_t (*)[32])tmp.txids_le, tmp.tx_count,
                                            &tmp.merkle_branch, &tmp.merkle_count)) {
         bitcoin_free_job(&tmp);
@@ -926,14 +943,12 @@ void bitcoin_update_template(bool force_clean) {
         return;
     }
 
-    // Now commit to global history with lock, decide clean based on previous prevhash change
     Template notify_snapshot;
     template_zero(&notify_snapshot);
 
     pthread_mutex_lock(&g_tmpl_lock);
     Template *last = &g_jobs[g_job_head];
     if (last->valid) {
-        // compare prevhash using prev_hash_stratum string (stable)
         if (strncmp(last->prev_hash_stratum, tmp.prev_hash_stratum, 64) != 0) clean = true;
     }
     tmp.clean_jobs = clean;
@@ -941,19 +956,16 @@ void bitcoin_update_template(bool force_clean) {
     g_job_head = (g_job_head + 1) % MAX_JOB_HISTORY;
     Template *curr = &g_jobs[g_job_head];
     bitcoin_free_job(curr);
-    *curr = tmp; // shallow move of owned pointers into ring
-    // tmp must not be freed now; null it to avoid double free
+    *curr = tmp;
     template_zero(&tmp);
     curr->valid = true;
 
-    // make notify snapshot to send outside lock
     (void)template_deep_copy_notify(&notify_snapshot, curr);
     pthread_mutex_unlock(&g_tmpl_lock);
 
     log_info("Job %s [H:%u Tx:%zu] Clean:%d", notify_snapshot.job_id, notify_snapshot.height,
              notify_snapshot.tx_count, notify_snapshot.clean_jobs ? 1 : 0);
 
-    // Broadcast outside template lock
     stratum_broadcast_job(&notify_snapshot);
     bitcoin_free_job(&notify_snapshot);
 

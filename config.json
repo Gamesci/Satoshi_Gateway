@@ -1,14 +1,19 @@
 {
-  "rpc_url": "127.0.0.1:8332",
-  "rpc_user": "user",
-  "rpc_pass": "password",
+  "rpc_url": "http://127.0.0.1:8332",
+  "rpc_user": "bitcoinrpc",
+  "rpc_pass": "change_me",
+
   "zmq_pub_hashblock": "tcp://127.0.0.1:28332",
-  "reward_address": "bc1qxy2xxxxxxxxxxxxxxxxxxxxx",
-  "pool_tag": "/Satoshi_Gateway/",
+
+  "reward_address": "bc1qxxxxxxxxxxxxxxxxxxxxxxxx",
+  "pool_tag": "/SatoshiGateway/",
+
   "listen_port": 3333,
-  "poll_interval": "30",
+  "poll_interval": 30,
+
   "diff_asic": 1024,
   "vardiff_target_shares_min": 6,
+
   "extranonce2_size": 8,
   "version_mask": "1fffe000"
 }

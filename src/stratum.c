@@ -8,6 +8,7 @@
 #include <netinet/in.h>
 #include <errno.h>
 #include <jansson.h>
+#include <ctype.h>
 
 #include "stratum.h"
 #include "config.h"
@@ -51,6 +52,8 @@ static void init_clients(void) {
     for (int i = 0; i < MAX_CLIENTS; i++) {
         g_clients[i].active = false;
         g_clients[i].sock = -1;
+        g_clients[i].is_authorized = false;
+        g_clients[i].last_job_id[0] = '\0';
     }
 }
 
@@ -70,6 +73,8 @@ static Client* client_add(int sock, struct sockaddr_in addr) {
             c->shares_in_window = 0;
 
             snprintf(c->extranonce1_hex, sizeof(c->extranonce1_hex), "%08x", (uint32_t)c->id);
+            c->last_job_id[0] = '\0';
+
             pthread_mutex_unlock(&g_clients_lock);
             return c;
         }
@@ -85,6 +90,8 @@ static void client_remove(Client *c) {
         close(c->sock);
         c->active = false;
         c->sock = -1;
+        c->is_authorized = false;
+        c->last_job_id[0] = '\0';
         log_info("Client %d disconnected", c->id);
     }
     pthread_mutex_unlock(&g_clients_lock);
@@ -115,7 +122,95 @@ static void send_difficulty(Client *c, double diff) {
     json_decref(res);
 }
 
+// ---------- helpers ----------
+static bool is_fixed_hex(const char *s, size_t n) {
+    if (!s || strlen(s) != n) return false;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (!isxdigit(c)) return false;
+    }
+    return true;
+}
+
+static bool is_all_digits(const char *s) {
+    if (!s || !*s) return false;
+    for (const char *p = s; *p; p++) {
+        if (*p < '0' || *p > '9') return false;
+    }
+    return true;
+}
+
+// nonce auto parse: accept decimal or hex string
+static void parse_nonce_auto(const char *s,
+                            bool *ok_dec, uint32_t *val_dec,
+                            bool *ok_hex, uint32_t *val_hex) {
+    if (ok_dec) *ok_dec = false;
+    if (ok_hex) *ok_hex = false;
+    if (val_dec) *val_dec = 0;
+    if (val_hex) *val_hex = 0;
+    if (!s || !*s) return;
+
+    bool has_hex_alpha = false;
+    for (const char *p = s; *p; p++) {
+        if ((*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F')) {
+            has_hex_alpha = true;
+            break;
+        }
+    }
+
+    // hex attempt
+    if (is_fixed_hex(s, strlen(s))) {
+        char *end = NULL;
+        unsigned long v = strtoul(s, &end, 16);
+        if (end && *end == '\0' && v <= 0xffffffffUL) {
+            if (ok_hex) *ok_hex = true;
+            if (val_hex) *val_hex = (uint32_t)v;
+        }
+    }
+
+    if (has_hex_alpha) return;
+
+    // dec attempt
+    if (is_all_digits(s)) {
+        char *end = NULL;
+        unsigned long v = strtoul(s, &end, 10);
+        if (end && *end == '\0' && v <= 0xffffffffUL) {
+            if (ok_dec) *ok_dec = true;
+            if (val_dec) *val_dec = (uint32_t)v;
+        }
+    }
+}
+
+static void json_reply_error(json_t *res, int code, const char *msg) {
+    json_object_set_new(res, "result", json_false());
+    json_t *e = json_array();
+    json_array_append_new(e, json_integer(code));
+    json_array_append_new(e, json_string(msg));
+    json_object_set_new(res, "error", e);
+}
+
+static Client* client_find_by_sock(int sock) {
+    Client *out = NULL;
+    pthread_mutex_lock(&g_clients_lock);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (g_clients[i].active && g_clients[i].sock == sock) {
+            out = &g_clients[i];
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_clients_lock);
+    return out;
+}
+
 void stratum_send_mining_notify(int sock, Template *tmpl) {
+    if (!tmpl) return;
+
+    // remember last job_id for this client
+    Client *c = client_find_by_sock(sock);
+    if (c) {
+        snprintf(c->last_job_id, sizeof(c->last_job_id), "%s", tmpl->job_id ? tmpl->job_id : "");
+    }
+
     json_t *p = json_array();
     json_array_append_new(p, json_string(tmpl->job_id));
     json_array_append_new(p, json_string(tmpl->prev_hash_stratum));
@@ -157,25 +252,6 @@ void stratum_broadcast_job(Template *tmpl) {
         stratum_send_mining_notify(sockets[i], tmpl);
     }
     if (count > 0) log_info("Broadcast job %s to %d miners", tmpl->job_id, count);
-}
-
-static bool is_fixed_hex(const char *s, size_t n) {
-    if (!s || strlen(s) != n) return false;
-    for (size_t i = 0; i < n; i++) {
-        char c = s[i];
-        if (!((c >= '0' && c <= '9') ||
-              (c >= 'a' && c <= 'f') ||
-              (c >= 'A' && c <= 'F'))) return false;
-    }
-    return true;
-}
-
-static void json_reply_error(json_t *res, int code, const char *msg) {
-    json_object_set_new(res, "result", json_false());
-    json_t *e = json_array();
-    json_array_append_new(e, json_integer(code));
-    json_array_append_new(e, json_string(msg));
-    json_object_set_new(res, "error", e);
 }
 
 static void *client_worker(void *arg) {
@@ -284,11 +360,11 @@ static void *client_worker(void *arg) {
                         if (json_array_size(p) >= 6) vh = json_string_value(json_array_get(p, 5));
                         if (!vh) vh = "";
 
-                        // strict validation
+                        // strict validation except nonce (nonce can be dec or hex)
                         if (!jid || strlen(jid) == 0 ||
-                            !is_fixed_hex(en2, (size_t)g_config.extranonce2_size * 2) ||
-                            !is_fixed_hex(nt, 8) ||
-                            !is_fixed_hex(nh, 8) ||
+                            !en2 || !is_fixed_hex(en2, (size_t)g_config.extranonce2_size * 2) ||
+                            !nt  || !is_fixed_hex(nt, 8) ||
+                            !nh  || strlen(nh) == 0 ||
                             (strlen(vh) > 0 && !is_fixed_hex(vh, 8))) {
                             json_reply_error(res, 20, "Invalid submit fields");
                             send_json(c->sock, res);
@@ -298,10 +374,41 @@ static void *client_worker(void *arg) {
                             continue;
                         }
 
-                        // Build duplicate fingerprint from fixed-size fields
+                        uint32_t version_bits = 0;
+                        if (vh[0]) version_bits = (uint32_t)strtoul(vh, NULL, 16);
+
+                        bool ok_dec = false, ok_hex = false;
+                        uint32_t nonce_dec = 0, nonce_hex = 0;
+                        parse_nonce_auto(nh, &ok_dec, &nonce_dec, &ok_hex, &nonce_hex);
+                        if (!ok_dec && !ok_hex) {
+                            json_reply_error(res, 20, "Invalid nonce");
+                            send_json(c->sock, res);
+                            json_decref(res);
+                            json_decref(req);
+                            start = end + 1;
+                            continue;
+                        }
+
+                        char full_extranonce[128];
+                        snprintf(full_extranonce, sizeof(full_extranonce), "%s%s", c->extranonce1_hex, en2);
+
+                        const char *jid_used = jid;
+                        int ret = 0;
+
+                        // try job_id as provided, then fallback to last_job_id if needed
+                        if (ok_dec) ret = bitcoin_validate_and_submit(jid, full_extranonce, nt, nonce_dec, version_bits, c->current_diff);
+                        if (ret == 0 && ok_hex) ret = bitcoin_validate_and_submit(jid, full_extranonce, nt, nonce_hex, version_bits, c->current_diff);
+
+                        if (ret == 0 && c->last_job_id[0] && strcmp(c->last_job_id, jid) != 0) {
+                            jid_used = c->last_job_id;
+                            if (ok_dec) ret = bitcoin_validate_and_submit(jid_used, full_extranonce, nt, nonce_dec, version_bits, c->current_diff);
+                            if (ret == 0 && ok_hex) ret = bitcoin_validate_and_submit(jid_used, full_extranonce, nt, nonce_hex, version_bits, c->current_diff);
+                        }
+
+                        // duplicate fingerprint (use actual job_id used)
                         char keybuf[256];
                         snprintf(keybuf, sizeof(keybuf), "%s|%s|%s|%s|%s|%d",
-                                 jid, c->extranonce1_hex, en2, nt, nh, c->id);
+                                 jid_used, c->extranonce1_hex, en2, nt, nh, c->id);
                         uint64_t fp = fnv1a64(keybuf, strlen(keybuf));
                         if (is_duplicate_share_fp(fp)) {
                             json_reply_error(res, 22, "Duplicate");
@@ -312,14 +419,6 @@ static void *client_worker(void *arg) {
                             continue;
                         }
 
-                        uint32_t version_bits = 0;
-                        if (vh[0]) version_bits = (uint32_t)strtoul(vh, NULL, 16);
-                        uint32_t nonce = (uint32_t)strtoul(nh, NULL, 16);
-
-                        char full_extranonce[128];
-                        snprintf(full_extranonce, sizeof(full_extranonce), "%s%s", c->extranonce1_hex, en2);
-
-                        int ret = bitcoin_validate_and_submit(jid, full_extranonce, nt, nonce, version_bits, c->current_diff);
                         if (ret == 0) {
                             json_reply_error(res, 21, "Stale or Low Difficulty");
                         } else {
@@ -347,7 +446,6 @@ static void *client_worker(void *arg) {
                                     c->current_diff = new_diff;
                                     send_difficulty(c, new_diff);
 
-                                    // send clean job to force switch
                                     Template t;
                                     if (bitcoin_get_latest_job(&t)) {
                                         t.clean_jobs = true;

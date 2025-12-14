@@ -118,7 +118,7 @@ static bool is_zero256_be(const uint8_t x[32]) {
     return true;
 }
 
-// Divide 256-bit BE integer by 64-bit BE-ish? We'll implement long division by 64-bit divisor in base 256.
+// Divide 256-bit BE integer by 64-bit divisor in base 256.
 static void div256_u64_be(uint8_t x[32], uint64_t div) {
     if (div == 0) { memset(x, 0, 32); return; }
     __uint128_t rem = 0;
@@ -129,47 +129,40 @@ static void div256_u64_be(uint8_t x[32], uint64_t div) {
     }
 }
 
-// Convert diff -> target using high-precision approach:
+// Convert diff -> target:
 // target = diff1_target / diff
-// We implement: represent diff as mantissa * 2^exp (binary), then do integer division by mantissa and shift.
+// 修复点：先除 mant 再 shift，避免在 256-bit 容器里左移导致溢出截断
 static bool diff_to_target_be(double diff, uint8_t target_be[32]) {
     if (!(diff > 0.0) || !isfinite(diff)) return false;
 
-    // Clamp: Stratum diff should not be <1 in typical pools; allow but clamp to 1 to avoid target > diff1.
+    // Clamp: allow but avoid target > diff1
     if (diff < 1.0) diff = 1.0;
 
-    // Decompose diff = m * 2^e, with m in [0.5,1)
+    // diff = m * 2^e2, m in [0.5,1)
     int e2 = 0;
-    double m = frexp(diff, &e2); // diff = m * 2^e2
+    double m = frexp(diff, &e2);
 
-    // Scale mantissa to 64-bit integer for division
-    // mant = round(m * 2^64). Since m<1, mant fits in 64 bits.
+    // mant = round(m * 2^64)
     long double md = (long double)m;
     long double scaled = md * (long double)18446744073709551616.0L; // 2^64
     uint64_t mant = (uint64_t)(scaled + 0.5L);
     if (mant == 0) mant = 1;
 
-    // target = diff1 / (mant * 2^(e2-64))
-    // = (diff1 * 2^(64 - e2)) / mant
     uint8_t t[32];
     diff1_target_be(t);
 
-    // FIX: Perform division BEFORE shift to prevent overflow of the 256-bit buffer.
-    // Diff1 is approx 2^224. If we shift left by e.g. 53 (for diff=1024), it exceeds 256 bits.
-    // By dividing first, we reduce the number significantly, making the subsequent shift safe.
+    // 关键修复：先除以 mant，降低数值，再进行 shift（避免溢出截断）
     div256_u64_be(t, mant);
 
-    // Apply shift left by (64 - e2) if positive, else shift right by (e2 - 64) using division by 2^k.
     int shift = 64 - e2;
     if (shift > 0) {
         if (shift > 255) shift = 255;
         shl256_be(t, (unsigned)shift);
     } else if (shift < 0) {
-        // right shift by -shift: repeated div by 2^k = div by 2^(-shift)
+        // right shift by -shift
         int r = -shift;
         if (r > 255) { memset(t, 0, 32); }
         else {
-            // divide by 2^r: do it byte-wise with carry
             unsigned bytes = (unsigned)(r / 8);
             unsigned bits  = (unsigned)(r % 8);
             if (bytes >= 32) memset(t, 0, 32);
@@ -193,7 +186,6 @@ static bool diff_to_target_be(double diff, uint8_t target_be[32]) {
     }
 
     if (is_zero256_be(t)) {
-        // Avoid zero target
         t[31] = 1;
     }
     memcpy(target_be, t, 32);
@@ -711,10 +703,7 @@ int bitcoin_validate_and_submit(const char *job_id,
     }
     put_le32(head + 0, ver);
 
-    // prevhash: use stored header-ready LE bytes (no reconstruction hacks)
     memcpy(head + 4, job->prevhash_le, 32);
-
-    // merkle root: LE bytes
     memcpy(head + 36, root_le, 32);
 
     uint32_t ntime = (uint32_t)strtoul(ntime_hex, NULL, 16);
@@ -749,7 +738,7 @@ int bitcoin_validate_and_submit(const char *job_id,
 
     int result = 0;
     if (!accepted && !is_block) {
-        result = 0; // low diff
+        result = 0;
     } else if (is_block) {
         log_info(">>> BLOCK FOUND! Hash: %s", hash_hex);
 
@@ -829,7 +818,6 @@ void bitcoin_update_template(bool force_clean) {
     uint8_t prev_be[32];
     if (!hex2bin_checked(prev, prev_be, 32)) { json_decref(resp); return; }
 
-    // Header needs prevhash as LE bytes
     uint8_t prev_le[32];
     memcpy(prev_le, prev_be, 32);
     reverse_bytes(prev_le, 32);
@@ -868,16 +856,13 @@ void bitcoin_update_template(bool force_clean) {
     tmp.curtime_val = (uint32_t)json_integer_value(json_object_get(res, "curtime"));
     snprintf(tmp.ntime_hex, sizeof(tmp.ntime_hex), "%08x", tmp.curtime_val);
 
-    // Store prevhash for header
     memcpy(tmp.prevhash_le, prev_le, 32);
 
-    // prev_hash_stratum = hex(swap32(prev_le)) as your original design
     uint8_t prev_stratum[32];
     memcpy(prev_stratum, prev_le, 32);
     swap32_buffer(prev_stratum, 32);
     (void)bin2hex_safe(prev_stratum, 32, tmp.prev_hash_stratum, sizeof(tmp.prev_hash_stratum));
 
-    // transactions
     json_t *txs = json_object_get(res, "transactions");
     size_t tx_count = (txs && json_is_array(txs)) ? json_array_size(txs) : 0;
     tmp.tx_count = tx_count;

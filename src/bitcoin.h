@@ -15,9 +15,8 @@ typedef struct {
     char coinb1[8192];
     char coinb2[8192];
 
-    // merkle_branch: siblings for coinbase path
-    // stored as hex of 32-byte LITTLE-ENDIAN hash (standard for Stratum)
-    char **merkle_branch;     // array of hex strings, each 64 chars + '\0'
+    // merkle_branch: siblings for coinbase path (LE hex)
+    char **merkle_branch;
     size_t merkle_count;
 
     char version_hex[9];
@@ -33,36 +32,23 @@ typedef struct {
     uint32_t height;
     int64_t coinbase_value;
 
+    // New: prevhash serialized for block header (32 bytes LE)
+    uint8_t prevhash_le[32];
+
     // Non-coinbase txids in LITTLE-ENDIAN bytes
     uint8_t (*txids_le)[32];
     size_t tx_count;
 
     // For building block when found
-    char **tx_hexs;           // raw tx hex (as given by GBT "data")
+    char **tx_hexs;
 } Template;
 
 int bitcoin_init(void);
 void bitcoin_update_template(bool force_clean);
 
-/**
- * Returns a deep-copied snapshot suitable for mining.notify sending.
- * Caller must free with bitcoin_job_free().
- */
 bool bitcoin_get_latest_job(Template *out);
-
-/**
- * Free a Template snapshot produced by bitcoin_get_latest_job or internal job storage.
- * Safe to call on partially-filled templates.
- */
 void bitcoin_free_job(Template *t);
 
-/**
- * Validate share against per-connection difficulty and submit block if found.
- * Returns:
- * 0 = rejected (stale/invalid/low diff)
- * 1 = share accepted
- * 2 = block found and submitted (submitblock accepted)
- */
 int bitcoin_validate_and_submit(const char *job_id,
                                 const char *full_extranonce_hex,
                                 const char *ntime_hex,

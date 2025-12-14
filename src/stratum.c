@@ -287,6 +287,16 @@ void *client_worker(void *arg) {
                                         log_info("VarDiff ID=%d: %.0f -> %.0f (SPM: %.1f)", c->id, c->current_diff, new_diff, spm);
                                         c->current_diff = new_diff;
                                         send_difficulty(c, new_diff);
+
+                                        // [FIX] 立即下发 clean=true 的最新作业，强制矿机切换到新难度
+                                        Template *t = malloc(sizeof(Template));
+                                        if(t) {
+                                            if(bitcoin_get_latest_job(t)) {
+                                                t->clean_jobs = true; 
+                                                stratum_send_mining_notify(c->sock, t);
+                                            }
+                                            free(t);
+                                        }
                                     }
                                     c->last_retarget_time = now;
                                     c->shares_in_window = 0;

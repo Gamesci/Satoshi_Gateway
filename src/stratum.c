@@ -435,8 +435,8 @@ static void *client_worker(void *arg) {
                                 double new_diff = c->current_diff;
                                 bool changed = false;
 
-                                if (spm < target * 0.4) { new_diff /= 2.0; changed = true; }
-                                else if (spm > target * 1.5) { new_diff *= 2.0; changed = true; }
+                                if (spm < target * 0.4) { new_diff /= 1.2; changed = true; }
+                                else if (spm > target * 1.5) { new_diff *= 1.2; changed = true; }
 
                                 if (new_diff < g_config.vardiff_min_diff) new_diff = g_config.vardiff_min_diff;
                                 if (new_diff > g_config.vardiff_max_diff) new_diff = g_config.vardiff_max_diff;

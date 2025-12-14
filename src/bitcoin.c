@@ -110,7 +110,6 @@ static void shl256_be(uint8_t x[32], unsigned k) {
 
 // Convert diff -> target:
 // target = diff1_target / diff
-// 修复点：先除 mant 再 shift，避免 256-bit 容器里左移溢出截断
 static bool diff_to_target_be(double diff, uint8_t target_be[32]) {
     if (!(diff > 0.0) || !isfinite(diff)) return false;
 
@@ -175,6 +174,14 @@ static bool is_hex_len(const char *s, size_t expect_len) {
               (c >= 'A' && c <= 'F'))) return false;
     }
     return true;
+}
+
+// ---------- varint (moved up for use in coinbase build) ----------
+static int encode_varint(uint8_t *buf, uint64_t n) {
+    if (n < 0xfd) { buf[0] = (uint8_t)n; return 1; }
+    if (n <= 0xffff) { buf[0] = 0xfd; put_le16(buf + 1, (uint16_t)n); return 3; }
+    if (n <= 0xffffffffULL) { buf[0] = 0xfe; put_le32(buf + 1, (uint32_t)n); return 5; }
+    buf[0] = 0xff; put_le64(buf + 1, (uint64_t)n); return 9;
 }
 
 static void ensure_dir_backup(void) {
@@ -404,7 +411,8 @@ static bool build_coinbase_hex(uint32_t height, int64_t value_sats,
     if (extranonce1_size <= 0 || extranonce2_size <= 0) return false;
     if (extranonce1_size + extranonce2_size > 64) return false;
 
-    uint8_t scriptSig[256];
+    // scriptSig buffer enlarged to 1024 to support longer scripts safely
+    uint8_t scriptSig[1024];
     size_t sp = 0;
 
     // BIP34 height encoding
@@ -454,8 +462,8 @@ static bool build_coinbase_hex(uint32_t height, int64_t value_sats,
     memset(tx_prefix + tp, 0, 32); tp += 32;         // prevout hash
     put_le32(tx_prefix + tp, 0xffffffffU); tp += 4;  // prevout index
 
-    if (sp < 0xfd) tx_prefix[tp++] = (uint8_t)sp;
-    else return false;
+    // FIX: Use proper varint encoding for scriptSig length instead of hard check
+    tp += encode_varint(tx_prefix + tp, (uint64_t)sp);
 
     size_t en1_end = en_data_offset_in_script + (size_t)extranonce1_size;
     size_t en2_end = en1_end + (size_t)extranonce2_size;
@@ -597,14 +605,6 @@ static bool calculate_merkle_branch_from_txids(const uint8_t (*txids_le)[32], si
     return true;
 }
 
-// ---------- varint ----------
-static int encode_varint(uint8_t *buf, uint64_t n) {
-    if (n < 0xfd) { buf[0] = (uint8_t)n; return 1; }
-    if (n <= 0xffff) { buf[0] = 0xfd; put_le16(buf + 1, (uint16_t)n); return 3; }
-    if (n <= 0xffffffffULL) { buf[0] = 0xfe; put_le32(buf + 1, (uint32_t)n); return 5; }
-    buf[0] = 0xff; put_le64(buf + 1, (uint64_t)n); return 9;
-}
-
 // ---------- submit block ----------
 static int bitcoin_submit_block(const char *hex_data) {
     json_t *params = json_array();
@@ -728,7 +728,8 @@ int bitcoin_validate_and_submit(const char *job_id,
 
         size_t tx_total = 1 + job->tx_count;
 
-        size_t cap = 2000000;
+        // FIX: Increase buffer size to 10MB to support large SegWit blocks
+        size_t cap = 10 * 1024 * 1024;
         char *block_hex = malloc(cap);
         if (!block_hex) {
             free(coin_bin); free(coin_hex); pthread_mutex_unlock(&g_tmpl_lock);

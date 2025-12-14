@@ -64,7 +64,8 @@ make
   "listen_port": 3333,                   // Stratum 服务监听端口
   
   "diff_asic": 1024,                     // 起始难度 (重要，见下文硬件适配)
-  "vardiff_target_shares_min": 20        // VarDiff 目标每分钟提交的 Share 数量
+  "vardiff_target_shares_min": 5,       // VarDiff 目标每分钟提交的 Share 数量
+  "extranonce2_size": 8                 // 矿工在为矿池工作时修改的额外 nonce
 }
 ```
 

@@ -16,9 +16,11 @@ typedef struct {
     bool active;
     bool is_authorized;
     pthread_t thread_id;
-    char extranonce1_hex[10];
-    
-    // VarDiff Stats
+
+    // extranonce1 fixed 4 bytes, hex length 8 + '\0'
+    char extranonce1_hex[9];
+
+    // VarDiff
     double current_diff;
     time_t last_retarget_time;
     int shares_in_window;
@@ -26,6 +28,6 @@ typedef struct {
 
 void stratum_send_mining_notify(int sock, Template *tmpl);
 void stratum_broadcast_job(Template *tmpl);
-int stratum_start_thread();
+int stratum_start_thread(void);
 
 #endif

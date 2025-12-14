@@ -13,15 +13,14 @@ typedef struct {
     char coinbase_tag[64];
     int stratum_port;
     int poll_interval_sec;
-    
-    // 难度与 VarDiff 配置
-    int initial_diff;       // 对应 config.json 中的 diff_asic
-    int vardiff_target;     // 对应 config.json 中的 vardiff_target_shares_min
-    int vardiff_min_diff;   // 动态难度下限
-    int vardiff_max_diff;   // 动态难度上限
-    
+
+    int initial_diff;
+    int vardiff_target;
+    int vardiff_min_diff;
+    int vardiff_max_diff;
+
     int extranonce2_size;
-    uint32_t version_mask;  // Version Rolling Mask
+    uint32_t version_mask;
 } Config;
 
 extern Config g_config;

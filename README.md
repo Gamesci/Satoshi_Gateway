@@ -6,7 +6,7 @@
 它充当比特币全节点（Bitcoin Core）与矿机之间的桥梁，通过 Stratum V1 协议将矿机连接到主网，支持从微型矿机（如 ESP32/NerdMiner）到高性能家用 ASIC（如 Bitaxe）的多种设备。
 
 > **注意**：本项目定位为 MVP（最小可行性产品），旨在提供清晰、易读且功能完备的代码库，适合学习比特币协议或搭建私人矿池。如果您需要承载数万台矿机的大型矿池方案，建议参考 [Datum Gateway](https://github.com/OCEAN-xyz/datum_gateway)。
-建议：为了避免混淆，建议将 Bitaxe/S19 上的地址也设置为与 config.json 一致，影响实际挖矿和收益归属。
+建议：为了避免混淆，建议将矿机上的地址也设置为与 config.json 一致，影响实际挖矿和收益归属。
 风险提示：务必仔细检查 config.json 中的 reward_address，这才是唯一决定钱去哪里的配置。
 
 ## 核心特性

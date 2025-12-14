@@ -9,6 +9,8 @@
 #include <time.h>
 #include <errno.h>
 #include <math.h>
+#include <stdbool.h>
+#include <stdint.h>
 
 #include "bitcoin.h"
 #include "config.h"
@@ -56,31 +58,25 @@ static void nbits_to_target_be(uint32_t nbits, uint8_t target_be[32]) {
 // diff1 target (Bitcoin) = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
 static void diff1_target_be(uint8_t out[32]) {
     memset(out, 0, 32);
-    // Big-endian placement:
-    // 00 00 00 00 FF FF 00 00 00 ... 00
     out[4] = 0xff;
     out[5] = 0xff;
     out[6] = 0x00;
     out[7] = 0x00;
 }
 
-// Integer division of 256-bit big-endian by uint32 divisor (div>0)
-static void div256_u32_be(uint8_t x[32], uint32_t div) {
-    uint64_t rem = 0;
-    for (int i = 0; i < 32; i++) {
-        uint64_t cur = (rem << 8) | x[i];
-        x[i] = (uint8_t)(cur / div);
-        rem = cur % div;
-    }
+static bool is_zero256_be(const uint8_t x[32]) {
+    for (int i = 0; i < 32; i++) if (x[i] != 0) return false;
+    return true;
 }
 
-// Multiply 256-bit big-endian by uint32, keep low 256 bits. Returns carry (overflow) discarded.
-static void mul256_u32_be(uint8_t x[32], uint32_t mul) {
-    uint64_t carry = 0;
-    for (int i = 31; i >= 0; i--) {
-        uint64_t prod = (uint64_t)x[i] * (uint64_t)mul + carry;
-        x[i] = (uint8_t)(prod & 0xff);
-        carry = prod >> 8;
+// Divide 256-bit BE integer by 64-bit divisor in base 256.
+static void div256_u64_be(uint8_t x[32], uint64_t div) {
+    if (div == 0) { memset(x, 0, 32); return; }
+    __uint128_t rem = 0;
+    for (int i = 0; i < 32; i++) {
+        __uint128_t cur = (rem << 8) | x[i];
+        x[i] = (uint8_t)(cur / div);
+        rem = cur % div;
     }
 }
 
@@ -112,37 +108,17 @@ static void shl256_be(uint8_t x[32], unsigned k) {
     }
 }
 
-// Compare 256-bit BE to zero
-static bool is_zero256_be(const uint8_t x[32]) {
-    for (int i = 0; i < 32; i++) if (x[i] != 0) return false;
-    return true;
-}
-
-// Divide 256-bit BE integer by 64-bit divisor in base 256.
-static void div256_u64_be(uint8_t x[32], uint64_t div) {
-    if (div == 0) { memset(x, 0, 32); return; }
-    __uint128_t rem = 0;
-    for (int i = 0; i < 32; i++) {
-        __uint128_t cur = (rem << 8) | x[i];
-        x[i] = (uint8_t)(cur / div);
-        rem = cur % div;
-    }
-}
-
 // Convert diff -> target:
 // target = diff1_target / diff
-// 修复点：先除 mant 再 shift，避免在 256-bit 容器里左移导致溢出截断
+// 修复点：先除 mant 再 shift，避免 256-bit 容器里左移溢出截断
 static bool diff_to_target_be(double diff, uint8_t target_be[32]) {
     if (!(diff > 0.0) || !isfinite(diff)) return false;
 
-    // Clamp: allow but avoid target > diff1
     if (diff < 1.0) diff = 1.0;
 
-    // diff = m * 2^e2, m in [0.5,1)
     int e2 = 0;
     double m = frexp(diff, &e2);
 
-    // mant = round(m * 2^64)
     long double md = (long double)m;
     long double scaled = md * (long double)18446744073709551616.0L; // 2^64
     uint64_t mant = (uint64_t)(scaled + 0.5L);
@@ -151,7 +127,6 @@ static bool diff_to_target_be(double diff, uint8_t target_be[32]) {
     uint8_t t[32];
     diff1_target_be(t);
 
-    // 关键修复：先除以 mant，降低数值，再进行 shift（避免溢出截断）
     div256_u64_be(t, mant);
 
     int shift = 64 - e2;
@@ -159,10 +134,10 @@ static bool diff_to_target_be(double diff, uint8_t target_be[32]) {
         if (shift > 255) shift = 255;
         shl256_be(t, (unsigned)shift);
     } else if (shift < 0) {
-        // right shift by -shift
         int r = -shift;
-        if (r > 255) { memset(t, 0, 32); }
-        else {
+        if (r > 255) {
+            memset(t, 0, 32);
+        } else {
             unsigned bytes = (unsigned)(r / 8);
             unsigned bits  = (unsigned)(r % 8);
             if (bytes >= 32) memset(t, 0, 32);
@@ -185,9 +160,7 @@ static bool diff_to_target_be(double diff, uint8_t target_be[32]) {
         }
     }
 
-    if (is_zero256_be(t)) {
-        t[31] = 1;
-    }
+    if (is_zero256_be(t)) t[31] = 1;
     memcpy(target_be, t, 32);
     return true;
 }
@@ -347,14 +320,25 @@ void bitcoin_free_job(Template *t) {
         free(t->txids_le);
         t->txids_le = NULL;
     }
+
     t->tx_count = 0;
     t->valid = false;
 }
 
+// 深拷贝仅用于 notify/broadcast：只复制矿机需要的字段，避免 txids/tx_hexs 造成 UB
 static bool template_deep_copy_notify(Template *dst, const Template *src) {
+    if (!dst || !src) return false;
+    template_zero(dst);
+
+    // plain fields
     *dst = *src;
 
+    // do not share pointers
     dst->merkle_branch = NULL;
+    dst->tx_hexs = NULL;
+    dst->txids_le = NULL;
+
+    // copy merkle branch strings
     if (src->merkle_count > 0) {
         dst->merkle_branch = calloc(src->merkle_count, sizeof(char*));
         if (!dst->merkle_branch) return false;
@@ -363,9 +347,9 @@ static bool template_deep_copy_notify(Template *dst, const Template *src) {
             if (!dst->merkle_branch[i]) return false;
         }
     }
-    dst->tx_hexs = NULL;
-    dst->txids_le = NULL;
-    dst->tx_count = 0;
+
+    // notify snapshot不需要交易正文/txid数组，避免误用
+    dst->tx_count = src->tx_count;
     return true;
 }
 
@@ -385,7 +369,7 @@ bool bitcoin_get_latest_job(Template *out) {
     return ok;
 }
 
-// ---------- coinbase building (binary -> hex coinb1/coinb2) ----------
+// ---------- coinbase building ----------
 static size_t write_pushdata(uint8_t *dst, size_t cap, const uint8_t *data, size_t len) {
     if (len <= 75) {
         if (cap < 1 + len) return 0;
@@ -395,14 +379,14 @@ static size_t write_pushdata(uint8_t *dst, size_t cap, const uint8_t *data, size
     }
     if (len <= 255) {
         if (cap < 2 + len) return 0;
-        dst[0] = 0x4c; // OP_PUSHDATA1
+        dst[0] = 0x4c;
         dst[1] = (uint8_t)len;
         memcpy(dst + 2, data, len);
         return 2 + len;
     }
     if (len <= 65535) {
         if (cap < 3 + len) return 0;
-        dst[0] = 0x4d; // OP_PUSHDATA2
+        dst[0] = 0x4d;
         put_le16(dst + 1, (uint16_t)len);
         memcpy(dst + 3, data, len);
         return 3 + len;
@@ -433,14 +417,16 @@ static bool build_coinbase_hex(uint32_t height, int64_t value_sats,
     } while (th > 0);
     if (h_enc[h_len - 1] & 0x80) h_enc[h_len++] = 0x00;
 
-    sp += write_pushdata(scriptSig + sp, sizeof(scriptSig) - sp, h_enc, h_len);
-    if (sp == 0) return false;
+    size_t w1 = write_pushdata(scriptSig + sp, sizeof(scriptSig) - sp, h_enc, h_len);
+    if (w1 == 0) return false;
+    sp += w1;
 
     uint8_t en_placeholder[64];
-    memset(en_placeholder, 0, (size_t)(extranonce1_size + extranonce2_size));
     size_t en_tot = (size_t)(extranonce1_size + extranonce2_size);
-    size_t w = write_pushdata(scriptSig + sp, sizeof(scriptSig) - sp, en_placeholder, en_tot);
-    if (w == 0) return false;
+    memset(en_placeholder, 0, en_tot);
+
+    size_t w2 = write_pushdata(scriptSig + sp, sizeof(scriptSig) - sp, en_placeholder, en_tot);
+    if (w2 == 0) return false;
 
     size_t en_push_hdr = 0;
     if (en_tot <= 75) en_push_hdr = 1;
@@ -448,26 +434,25 @@ static bool build_coinbase_hex(uint32_t height, int64_t value_sats,
     else en_push_hdr = 3;
 
     size_t en_data_offset_in_script = sp + en_push_hdr;
-    sp += w;
+    sp += w2;
 
-    uint8_t tagbuf[64];
-    size_t taglen = 0;
     if (tag && tag[0]) {
-        taglen = strlen(tag);
+        uint8_t tagbuf[64];
+        size_t taglen = strlen(tag);
         if (taglen > 60) taglen = 60;
         memcpy(tagbuf, tag, taglen);
-        size_t w2 = write_pushdata(scriptSig + sp, sizeof(scriptSig) - sp, tagbuf, taglen);
-        if (w2 == 0) return false;
-        sp += w2;
+        size_t w3 = write_pushdata(scriptSig + sp, sizeof(scriptSig) - sp, tagbuf, taglen);
+        if (w3 == 0) return false;
+        sp += w3;
     }
 
     uint8_t tx_prefix[512];
     size_t tp = 0;
 
-    put_le32(tx_prefix + tp, 1); tp += 4;
-    tx_prefix[tp++] = 0x01;
-    memset(tx_prefix + tp, 0, 32); tp += 32;
-    put_le32(tx_prefix + tp, 0xffffffffU); tp += 4;
+    put_le32(tx_prefix + tp, 1); tp += 4;            // version
+    tx_prefix[tp++] = 0x01;                          // vin count
+    memset(tx_prefix + tp, 0, 32); tp += 32;         // prevout hash
+    put_le32(tx_prefix + tp, 0xffffffffU); tp += 4;  // prevout index
 
     if (sp < 0xfd) tx_prefix[tp++] = (uint8_t)sp;
     else return false;
@@ -489,7 +474,7 @@ static bool build_coinbase_hex(uint32_t height, int64_t value_sats,
     put_le32(coinb2_bin + c2, 0xffffffffU); c2 += 4;
 
     int outputs = 1;
-    bool has_wit_commit = (default_witness_commitment_hex && strlen(default_witness_commitment_hex) > 0);
+    bool has_wit_commit = (default_witness_commitment_hex && default_witness_commitment_hex[0]);
     if (has_wit_commit) outputs = 2;
 
     coinb2_bin[c2++] = (uint8_t)outputs;
@@ -519,7 +504,7 @@ static bool build_coinbase_hex(uint32_t height, int64_t value_sats,
         memcpy(coinb2_bin + c2, wbin, wlen); c2 += wlen;
     }
 
-    put_le32(coinb2_bin + c2, 0); c2 += 4;
+    put_le32(coinb2_bin + c2, 0); c2 += 4; // locktime
 
     if (!bin2hex_safe(coinb1_bin, c1, coinb1_hex, coinb1_cap)) return false;
     if (!bin2hex_safe(coinb2_bin, c2, coinb2_hex, coinb2_cap)) return false;
@@ -527,17 +512,19 @@ static bool build_coinbase_hex(uint32_t height, int64_t value_sats,
 }
 
 // ---------- merkle branch generation ----------
+// 输入 txids_le: tx_count 个 32字节(LE) txid，coinbase 另外算，branch返回给 stratum
 static bool calculate_merkle_branch_from_txids(const uint8_t (*txids_le)[32], size_t tx_count,
                                                char ***out_branch, size_t *out_count) {
     *out_branch = NULL;
     *out_count = 0;
 
-    size_t total = 1 + tx_count;
-    if (total == 1) return true;
+    size_t total = 1 + tx_count;   // coinbase + others
+    if (total == 1) return true;   // only coinbase => empty branch
 
     uint8_t *level = calloc(total, 32);
     if (!level) return false;
 
+    // level[0] 留给 coinbase hash（后面算），这里只填非 coinbase txid
     for (size_t i = 0; i < tx_count; i++) {
         memcpy(level + (i + 1) * 32, txids_le[i], 32);
     }
@@ -550,9 +537,14 @@ static bool calculate_merkle_branch_from_txids(const uint8_t (*txids_le)[32], si
     uint8_t *next = NULL;
 
     while (level_count > 1) {
+        // 对 coinbase 来说，兄弟节点是 index=1（若存在）
         const uint8_t *sib = (level_count > 1) ? (level + 1 * 32) : (level + 0);
         char hex[65];
-        (void)bin2hex_safe(sib, 32, hex, sizeof(hex));
+        if (!bin2hex_safe(sib, 32, hex, sizeof(hex))) {
+            free(level);
+            free(branch);
+            return false;
+        }
         branch[bcount] = strdup(hex);
         if (!branch[bcount]) {
             free(level);
@@ -655,7 +647,6 @@ int bitcoin_validate_and_submit(const char *job_id,
         return 0;
     }
 
-    // Build coinbase hex
     size_t coin_hex_len = strlen(job->coinb1) + strlen(full_extranonce_hex) + strlen(job->coinb2);
     if (coin_hex_len >= 20000) { pthread_mutex_unlock(&g_tmpl_lock); return 0; }
 
@@ -673,11 +664,9 @@ int bitcoin_validate_and_submit(const char *job_id,
         return 0;
     }
 
-    // coinbase txid (LE bytes)
     uint8_t coinbase_hash_le[32];
     sha256d(coin_bin, coin_bin_len, coinbase_hash_le);
 
-    // merkle root (LE bytes)
     uint8_t root_le[32];
     memcpy(root_le, coinbase_hash_le, 32);
 
@@ -693,7 +682,6 @@ int bitcoin_validate_and_submit(const char *job_id,
         sha256d(cat, 64, root_le);
     }
 
-    // Build header (80 bytes, serialized little-endian fields)
     uint8_t head[80];
     memset(head, 0, sizeof(head));
 
@@ -711,18 +699,15 @@ int bitcoin_validate_and_submit(const char *job_id,
     put_le32(head + 72, job->nbits_val);
     put_le32(head + 76, nonce);
 
-    // Hash header: sha256d -> LE bytes
     uint8_t hash_le[32];
     sha256d(head, 80, hash_le);
 
-    // Convert to BE for numeric compare and display
     uint8_t hash_be[32];
     for (int i = 0; i < 32; i++) hash_be[i] = hash_le[31 - i];
 
     char hash_hex[65];
     (void)bin2hex_safe(hash_be, 32, hash_hex, sizeof(hash_hex));
 
-    // Share target (from diff)
     uint8_t share_target_be[32];
     if (!diff_to_target_be(diff, share_target_be)) {
         free(coin_bin); free(coin_hex); pthread_mutex_unlock(&g_tmpl_lock);
@@ -731,7 +716,6 @@ int bitcoin_validate_and_submit(const char *job_id,
 
     int accepted = (cmp256_be(hash_be, share_target_be) <= 0);
 
-    // Block target from nbits
     uint8_t block_target_be[32];
     nbits_to_target_be(job->nbits_val, block_target_be);
     int is_block = (cmp256_be(hash_be, block_target_be) <= 0);
@@ -869,8 +853,10 @@ void bitcoin_update_template(bool force_clean) {
 
     tmp.txids_le = NULL;
     tmp.tx_hexs = NULL;
+
     if (tx_count > 0) {
-        tmp.txids_le = malloc(tx_count * 32);
+        // 关键修复：按 [32] 元素分配，保证 tmp.txids_le[i] 合法
+        tmp.txids_le = calloc(tx_count, sizeof(*tmp.txids_le));
         tmp.tx_hexs = calloc(tx_count, sizeof(char*));
         if (!tmp.txids_le || !tmp.tx_hexs) {
             bitcoin_free_job(&tmp);
@@ -929,6 +915,9 @@ void bitcoin_update_template(bool force_clean) {
         return;
     }
 
+    log_info("Template built %s [H:%u Tx:%zu Merkle:%zu Prev:%.16s]",
+             tmp.job_id, tmp.height, tmp.tx_count, tmp.merkle_count, tmp.prev_hash_stratum);
+
     Template notify_snapshot;
     template_zero(&notify_snapshot);
 
@@ -949,7 +938,8 @@ void bitcoin_update_template(bool force_clean) {
     (void)template_deep_copy_notify(&notify_snapshot, curr);
     pthread_mutex_unlock(&g_tmpl_lock);
 
-    log_info("Job %s [H:%u Tx:%zu] Clean:%d", notify_snapshot.job_id, notify_snapshot.height,
+    log_info("Job %s [H:%u Tx:%zu] Clean:%d",
+             notify_snapshot.job_id, notify_snapshot.height,
              notify_snapshot.tx_count, notify_snapshot.clean_jobs ? 1 : 0);
 
     stratum_broadcast_job(&notify_snapshot);

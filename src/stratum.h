@@ -9,6 +9,8 @@
 
 #define MAX_CLIENTS 1024
 
+#define STRATUM_JOBID_MAX 64
+
 typedef struct {
     int id;
     int sock;
@@ -19,6 +21,9 @@ typedef struct {
 
     // extranonce1 fixed 4 bytes, hex length 8 + '\0'
     char extranonce1_hex[9];
+
+    // NEW: remember last job_id we sent to this client (for job_id mismatch recovery)
+    char last_job_id[STRATUM_JOBID_MAX];
 
     // VarDiff
     double current_diff;

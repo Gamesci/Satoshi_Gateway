@@ -1,8 +1,3 @@
-基于我们之前的深入代码分析和讨论，为您起草了一份适用于 GitHub 仓库的 `README.md`。
-
-这份文档突出了 **Satoshi\_Gateway** 针对“家庭矿工”和“独立挖矿（Solo Mining）”的定位，同时也客观地指出了其架构特点和配置建议（特别是针对 Bitaxe 和 NerdMiner 的区别设置）。
-
------
 
 # Satoshi Gateway
 

@@ -154,6 +154,11 @@ static bool diff_to_target_be(double diff, uint8_t target_be[32]) {
     uint8_t t[32];
     diff1_target_be(t);
 
+    // FIX: Perform division BEFORE shift to prevent overflow of the 256-bit buffer.
+    // Diff1 is approx 2^224. If we shift left by e.g. 53 (for diff=1024), it exceeds 256 bits.
+    // By dividing first, we reduce the number significantly, making the subsequent shift safe.
+    div256_u64_be(t, mant);
+
     // Apply shift left by (64 - e2) if positive, else shift right by (e2 - 64) using division by 2^k.
     int shift = 64 - e2;
     if (shift > 0) {
@@ -186,10 +191,6 @@ static bool diff_to_target_be(double diff, uint8_t target_be[32]) {
             }
         }
     }
-
-    // Now divide by mant (uint64). This is approximate-but-very-close mapping from double diff.
-    // Good enough for share validation; most pools use integer or power-of-two diffs, where this is exact.
-    div256_u64_be(t, mant);
 
     if (is_zero256_be(t)) {
         // Avoid zero target

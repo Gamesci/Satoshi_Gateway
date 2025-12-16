@@ -111,14 +111,10 @@ static bool diff_to_target_be(double diff, uint8_t target_be[32]) {
         if (shift > 255) shift = 255;
         shl256_be(t, (unsigned)shift);
     } else if (shift < 0) {
-        // shift left by -shift
         int r = -shift;
         if (r > 255) memset(t, 0, 32);
         else {
-            // Simplified left shift helper logic for diff calc
-            // Reuse logic or just reset for safety if overly complex
-            // Here we assume standard diffs won't trigger this often
-             memset(t, 0, 32); // Edge case not hit in normal mining
+             memset(t, 0, 32);
         }
     }
     if (is_zero256_be(t)) t[31] = 1;
@@ -266,12 +262,10 @@ void bitcoin_free_job(Template *t) {
         t->tx_hexs = NULL;
     }
     if (t->txids_le) { free(t->txids_le); t->txids_le = NULL; }
-    if (t->wtxids_le) { free(t->wtxids_le); t->wtxids_le = NULL; } // NEW
     t->tx_count = 0;
     t->valid = false;
 }
 
-// Deep copy for stratum notify
 static bool template_deep_copy_notify(Template *dst, const Template *src) {
     if (!dst || !src) return false;
     template_zero(dst);
@@ -279,7 +273,6 @@ static bool template_deep_copy_notify(Template *dst, const Template *src) {
     dst->merkle_branch = NULL;
     dst->tx_hexs = NULL;
     dst->txids_le = NULL;
-    dst->wtxids_le = NULL;
 
     if (src->merkle_count > 0) {
         dst->merkle_branch = calloc(src->merkle_count, sizeof(char*));
@@ -305,7 +298,10 @@ bool bitcoin_get_latest_job(Template *out) {
     return ok;
 }
 
-// ---------- coinbase building (SegWit Compatible) ----------
+// ---------- coinbase building (Legacy Format for Stratum) ----------
+// IMPORTANT: This builds the coinbase as the MINER expects it (Legacy serialization).
+// SegWit markers and Witness data are intentionally EXCLUDED here so the miner
+// calculates the correct Legacy TxID for the Block Header Merkle Root.
 static size_t write_pushdata(uint8_t *dst, size_t cap, const uint8_t *data, size_t len) {
     if (len <= 75) {
         if (cap < 1 + len) return 0;
@@ -328,10 +324,9 @@ static size_t write_pushdata(uint8_t *dst, size_t cap, const uint8_t *data, size
     return 0;
 }
 
-// Updated build_coinbase_hex to support SegWit structure
 static bool build_coinbase_hex(uint32_t height, int64_t value_sats,
                                const char *tag,
-                               bool is_segwit, // NEW
+                               bool is_segwit,
                                const char *default_witness_commitment_hex,
                                int extranonce1_size,
                                int extranonce2_size,
@@ -340,11 +335,9 @@ static bool build_coinbase_hex(uint32_t height, int64_t value_sats,
     if (extranonce1_size <= 0 || extranonce2_size <= 0) return false;
     if (extranonce1_size + extranonce2_size > 64) return false;
 
-    // --- ScriptSig Construction ---
+    // --- ScriptSig ---
     uint8_t scriptSig[1024];
     size_t sp = 0;
-
-    // BIP34 height
     uint8_t h_enc[8];
     size_t h_len = 0;
     uint32_t th = height;
@@ -355,7 +348,6 @@ static bool build_coinbase_hex(uint32_t height, int64_t value_sats,
     if (w1 == 0) return false;
     sp += w1;
 
-    // ExtraNonce placeholder
     uint8_t en_placeholder[64];
     size_t en_tot = (size_t)(extranonce1_size + extranonce2_size);
     memset(en_placeholder, 0, en_tot);
@@ -366,7 +358,6 @@ static bool build_coinbase_hex(uint32_t height, int64_t value_sats,
     size_t en_data_offset_in_script = sp + en_push_hdr;
     sp += w2;
 
-    // Tag
     if (tag && tag[0]) {
         uint8_t tagbuf[64];
         size_t taglen = strlen(tag);
@@ -377,22 +368,14 @@ static bool build_coinbase_hex(uint32_t height, int64_t value_sats,
         sp += w3;
     }
 
-    // --- Coinb1 Construction ---
+    // --- Coinb1 (Legacy) ---
     uint8_t tx_prefix[512];
     size_t tp = 0;
-
     put_le32(tx_prefix + tp, 1); tp += 4; // version
-
-    // SEGWIT MARKER & FLAG: Insert 0x00 0x01 if this is a segwit block
-    if (is_segwit) {
-        tx_prefix[tp++] = 0x00; // Marker
-        tx_prefix[tp++] = 0x01; // Flag
-    }
-
-    tx_prefix[tp++] = 0x01;                          // vin count
-    memset(tx_prefix + tp, 0, 32); tp += 32;         // prevout hash
-    put_le32(tx_prefix + tp, 0xffffffffU); tp += 4;  // prevout index
-
+    // NO SEGWIT MARKER HERE!
+    tx_prefix[tp++] = 0x01; // vin count
+    memset(tx_prefix + tp, 0, 32); tp += 32;
+    put_le32(tx_prefix + tp, 0xffffffffU); tp += 4;
     tp += encode_varint(tx_prefix + tp, (uint64_t)sp);
 
     size_t en1_end = en_data_offset_in_script + (size_t)extranonce1_size;
@@ -405,11 +388,10 @@ static bool build_coinbase_hex(uint32_t height, int64_t value_sats,
     memcpy(coinb1_bin + c1, tx_prefix, tp); c1 += tp;
     memcpy(coinb1_bin + c1, scriptSig, en1_end); c1 += en1_end;
 
-    // --- Coinb2 Construction ---
+    // --- Coinb2 (Legacy) ---
     uint8_t coinb2_bin[4096];
     size_t c2 = 0;
     memcpy(coinb2_bin + c2, scriptSig + en2_end, sp - en2_end); c2 += (sp - en2_end);
-
     put_le32(coinb2_bin + c2, 0xffffffffU); c2 += 4; // sequence
 
     // Outputs
@@ -430,7 +412,7 @@ static bool build_coinbase_hex(uint32_t height, int64_t value_sats,
     if (!hex2bin_checked(script_hex, script_bin, script_len)) return false;
     memcpy(coinb2_bin + c2, script_bin, script_len); c2 += script_len;
 
-    // Output 2: Witness Commitment (Placeholder)
+    // Output 2: Witness Commitment (Must be in Body)
     if (has_wit_commit) {
         put_le64(coinb2_bin + c2, 0); c2 += 8; // value 0
         size_t wlen = strlen(default_witness_commitment_hex) / 2;
@@ -441,15 +423,7 @@ static bool build_coinbase_hex(uint32_t height, int64_t value_sats,
         memcpy(coinb2_bin + c2, wbin, wlen); c2 += wlen;
     }
 
-    // Witness Stack for Coinbase Input (Required if is_segwit)
-    // Format: [Count] [ItemSize] [Item]
-    // Coinbase witness is 1 item: the 32-byte witness reserved value (usually 0)
-    if (is_segwit) {
-        coinb2_bin[c2++] = 0x01; // Witness item count (1)
-        coinb2_bin[c2++] = 0x20; // Item size (32 bytes)
-        memset(coinb2_bin + c2, 0, 32); c2 += 32; // Witness Reserved Value (0x00...00)
-    }
-
+    // NO WITNESS STACK HERE!
     put_le32(coinb2_bin + c2, 0); c2 += 4; // locktime
 
     if (!bin2hex_safe(coinb1_bin, c1, coinb1_hex, coinb1_cap)) return false;
@@ -457,7 +431,6 @@ static bool build_coinbase_hex(uint32_t height, int64_t value_sats,
     return true;
 }
 
-// ---------- merkle branch generation ----------
 static bool calculate_merkle_branch_from_txids(const uint8_t (*txids_le)[32], size_t tx_count,
                                                char ***out_branch, size_t *out_count) {
     *out_branch = NULL; *out_count = 0;
@@ -507,36 +480,6 @@ static bool calculate_merkle_branch_from_txids(const uint8_t (*txids_le)[32], si
     return true;
 }
 
-// Calculate Merkle Root from a flat list of hashes (for Witness Root)
-// Note: hashes[0] is coinbase wtxid (assumed 0x00 for witness root calc)
-static void calculate_merkle_root(const uint8_t *hashes, size_t count, uint8_t root[32]) {
-    if (count == 0) { memset(root, 0, 32); return; }
-    if (count == 1) { memcpy(root, hashes, 32); return; }
-
-    size_t level_len = count;
-    uint8_t *level = malloc(count * 32);
-    memcpy(level, hashes, count * 32);
-
-    while (level_len > 1) {
-        size_t pairs = (level_len + 1) / 2;
-        uint8_t *next = malloc(pairs * 32);
-        for (size_t i = 0; i < pairs; i++) {
-            uint8_t *dst = next + i * 32;
-            uint8_t *L = level + (i * 2) * 32;
-            uint8_t *R = (i * 2 + 1 < level_len) ? (level + (i * 2 + 1) * 32) : L;
-            uint8_t buf[64];
-            memcpy(buf, L, 32); memcpy(buf + 32, R, 32);
-            sha256d(buf, 64, dst);
-        }
-        free(level);
-        level = next;
-        level_len = pairs;
-    }
-    memcpy(root, level, 32);
-    free(level);
-}
-
-// ---------- submit block ----------
 static int bitcoin_submit_block(const char *hex_data) {
     json_t *params = json_array();
     json_array_append_new(params, json_string(hex_data));
@@ -551,7 +494,6 @@ static int bitcoin_submit_block(const char *hex_data) {
     return success;
 }
 
-// ---------- validation ----------
 int bitcoin_validate_and_submit(const char *job_id,
                                 const char *full_extranonce_hex,
                                 const char *ntime_hex,
@@ -568,7 +510,7 @@ int bitcoin_validate_and_submit(const char *job_id,
     }
     if (!job) { pthread_mutex_unlock(&g_tmpl_lock); return 0; }
 
-    // Reconstruct Coinbase (SegWit aware)
+    // Reconstruct Coinbase (Legacy for PoW check)
     size_t coin_hex_len = strlen(job->coinb1) + strlen(full_extranonce_hex) + strlen(job->coinb2);
     if (coin_hex_len >= 32000) { pthread_mutex_unlock(&g_tmpl_lock); return 0; }
     
@@ -579,93 +521,11 @@ int bitcoin_validate_and_submit(const char *job_id,
     uint8_t *coin_bin = malloc(coin_bin_len);
     hex2bin_checked(coin_hex, coin_bin, coin_bin_len);
 
-    // --- SEG WIT COMMITMENT CORRECTION ---
-    // If SegWit, we must recalculate Witness Root and update the Commitment Output in coin_bin
-    if (job->has_segwit) {
-        // 1. Gather wTxIDs for Witness Tree
-        // Coinbase wTxID is 0x00...00 per BIP141 definition for the purpose of witness root calculation
-        size_t total_tx = 1 + job->tx_count;
-        uint8_t *w_leaves = calloc(total_tx, 32); // index 0 is already 0x00
-        for (size_t i = 0; i < job->tx_count; i++) {
-            memcpy(w_leaves + (i+1)*32, job->wtxids_le[i], 32);
-        }
-
-        // 2. Calc Witness Root
-        uint8_t wit_root[32];
-        calculate_merkle_root(w_leaves, total_tx, wit_root);
-        free(w_leaves);
-
-        // 3. Calc Witness Commitment Hash: SHA256d(wit_root + wit_reserved_value)
-        // wit_reserved_value is 32 bytes of 0x00 (we put that in coinb2 witness stack)
-        uint8_t commit_pre[64];
-        memcpy(commit_pre, wit_root, 32);
-        memset(commit_pre + 32, 0, 32);
-        uint8_t commit_hash[32];
-        sha256d(commit_pre, 64, commit_hash);
-
-        // 4. Find and replace in coin_bin
-        // Pattern: OP_RETURN (0x6a) + PUSH_36 (0x24) + HEADER (0xaa21a9ed)
-        // We look for this sequence in the output area.
-        uint8_t pattern[] = {0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed};
-        bool found = false;
-        // Optimization: outputs are usually near the end of coinb2, so we search coin_bin
-        // Start search after coinb1 length to avoid accidental header matches
-        size_t start_off = strlen(job->coinb1) / 2; 
-        for (size_t i = start_off; i < coin_bin_len - 38; i++) {
-            if (memcmp(coin_bin + i, pattern, 6) == 0) {
-                memcpy(coin_bin + i + 6, commit_hash, 32);
-                found = true;
-                break;
-            }
-        }
-        if (found) {
-            // Update hex string because we use it for final block assembly
-            bin2hex_safe(coin_bin, coin_bin_len, coin_hex, coin_hex_len + 1);
-        }
-    }
-
-    // --- Calculate TXID for Block Header (Legacy Merkle Root) ---
-    // We need the hash of the "Stripped" Coinbase (No witness, no marker/flag)
+    // Calc Legacy TxID
     uint8_t coinbase_txid[32];
-    if (job->has_segwit) {
-        // Strip SegWit fields to get Legacy TxID
-        // Structure: [Version 4][Marker 1][Flag 1][InCnt][...][OutCnt][...][Witness][Locktime 4]
-        // Stripped:  [Version 4]              [InCnt][...][OutCnt][...][Locktime 4]
-        
-        // Basic parser to find cut points. 
-        // 1. Version (4)
-        // 2. Marker/Flag (2) -> Skip
-        // 3. Inputs .. Outputs
-        // 4. Witness -> Skip (We need to identify where Witness starts)
-        // 5. Locktime (4)
-        
-        // Easier way: Construct it clean or parse it. 
-        // Since we built it, we know:
-        // [0..3] Version
-        // [4..5] Marker/Flag (00 01)
-        // [6..End-WitnessLen-4] Body
-        // [End-4..End] Locktime
-        
-        // Witness length? Coinbase witness is 1 item: [01][20][32x00] -> 34 bytes.
-        size_t wit_len = 1 + 1 + 32; 
-        size_t stripped_len = coin_bin_len - 2 - wit_len; // - marker/flag - witness
-        uint8_t *stripped = malloc(stripped_len);
-        
-        memcpy(stripped, coin_bin, 4); // Version
-        memcpy(stripped + 4, coin_bin + 6, coin_bin_len - 6 - wit_len - 4); // Body (skipping marker/flag and witness/locktime)
-        // Wait, Locktime is at the very end. 
-        // coin_bin: [Ver][0001][Body][Witness][Locktime]
-        // Body len = Total - 4(Ver) - 2(MF) - WitLen - 4(LT)
-        memcpy(stripped + 4 + (coin_bin_len - 6 - wit_len - 4), coin_bin + coin_bin_len - 4, 4); // Locktime
-        
-        sha256d(stripped, stripped_len, coinbase_txid);
-        free(stripped);
-    } else {
-        // Legacy: Just hash the whole thing
-        sha256d(coin_bin, coin_bin_len, coinbase_txid);
-    }
+    sha256d(coin_bin, coin_bin_len, coinbase_txid);
 
-    // --- Verify PoW ---
+    // Verify PoW
     uint8_t root_le[32];
     memcpy(root_le, coinbase_txid, 32);
 
@@ -691,7 +551,6 @@ int bitcoin_validate_and_submit(const char *job_id,
     uint8_t hash_le[32]; sha256d(head, 80, hash_le);
     uint8_t hash_be[32]; for(int i=0;i<32;i++) hash_be[i] = hash_le[31-i];
     
-    // Check difficulty
     uint8_t share_target_be[32];
     if (!diff_to_target_be(diff, share_target_be)) { free(coin_bin); free(coin_hex); pthread_mutex_unlock(&g_tmpl_lock); return 0; }
     int accepted = (cmp256_be(hash_be, share_target_be) <= 0);
@@ -706,6 +565,7 @@ int bitcoin_validate_and_submit(const char *job_id,
         char hash_hex[65]; bin2hex_safe(hash_be, 32, hash_hex, sizeof(hash_hex));
         log_info(">>> BLOCK FOUND! Hash: %s", hash_hex);
 
+        // --- CONSTRUCT BLOCK ---
         size_t cap = 10 * 1024 * 1024;
         char *block_hex = malloc(cap);
         if (!block_hex) { free(coin_bin); free(coin_hex); pthread_mutex_unlock(&g_tmpl_lock); return 1; }
@@ -714,14 +574,45 @@ int bitcoin_validate_and_submit(const char *job_id,
         char head_hex[161]; bin2hex_safe(head, 80, head_hex, sizeof(head_hex));
         memcpy(block_hex + pos, head_hex, 160); pos += 160;
 
-        // Block Tx Count
         uint8_t vi[9];
         int vl = encode_varint(vi, (uint64_t)(1 + job->tx_count));
         char vi_hex[19]; bin2hex_safe(vi, vl, vi_hex, sizeof(vi_hex));
         memcpy(block_hex + pos, vi_hex, strlen(vi_hex)); pos += strlen(vi_hex);
 
-        // Coinbase
-        memcpy(block_hex + pos, coin_hex, strlen(coin_hex)); pos += strlen(coin_hex);
+        // --- COINBASE INJECTION (SEGWIT TRANSFORMATION) ---
+        if (job->has_segwit) {
+            // Need to insert Marker (0001) and Witness Stack
+            // coin_bin (Legacy) = [Ver 4][In...][Out...][Lock 4]
+            // SegWit = [Ver 4][00 01][In...][Out...][Witness][Lock 4]
+            
+            // 1. Version
+            char part[128];
+            bin2hex_safe(coin_bin, 4, part, sizeof(part));
+            memcpy(block_hex + pos, part, 8); pos += 8;
+            
+            // 2. Marker/Flag
+            memcpy(block_hex + pos, "0001", 4); pos += 4;
+            
+            // 3. Inputs/Outputs (From 4 to end-4 of coin_bin)
+            size_t body_len = coin_bin_len - 8; 
+            char *body_hex = malloc(body_len * 2 + 1);
+            bin2hex_safe(coin_bin + 4, body_len, body_hex, body_len * 2 + 1);
+            memcpy(block_hex + pos, body_hex, strlen(body_hex)); pos += strlen(body_hex);
+            free(body_hex);
+            
+            // 4. Witness Stack for Coinbase
+            // [ItemCount 1][Size 32][32 bytes 0x00]
+            memcpy(block_hex + pos, "01200000000000000000000000000000000000000000000000000000000000000000", 68);
+            pos += 68;
+            
+            // 5. Locktime
+            bin2hex_safe(coin_bin + coin_bin_len - 4, 4, part, sizeof(part));
+            memcpy(block_hex + pos, part, 8); pos += 8;
+            
+        } else {
+            // Legacy -> Just use the hex
+            memcpy(block_hex + pos, coin_hex, strlen(coin_hex)); pos += strlen(coin_hex);
+        }
 
         // Other Tx
         for (size_t i = 0; i < job->tx_count; i++) {
@@ -749,7 +640,6 @@ int bitcoin_validate_and_submit(const char *job_id,
     return result;
 }
 
-// ---------- template update ----------
 void bitcoin_update_template(bool force_clean) {
     json_t *rules = json_array();
     json_array_append_new(rules, json_string("segwit"));
@@ -803,31 +693,16 @@ void bitcoin_update_template(bool force_clean) {
 
     if (tx_count > 0) {
         tmp.txids_le = calloc(tx_count, sizeof(*tmp.txids_le));
-        tmp.wtxids_le = calloc(tx_count, sizeof(*tmp.wtxids_le)); // NEW
         tmp.tx_hexs = calloc(tx_count, sizeof(char*));
 
         for (size_t i = 0; i < tx_count; i++) {
             json_t *tx = json_array_get(txs, i);
             const char *txid = json_string_value(json_object_get(tx, "txid"));
-            const char *hash = json_string_value(json_object_get(tx, "hash")); // wtxid
             const char *data = json_string_value(json_object_get(tx, "data"));
-
+            
             uint8_t bin[32];
             hex2bin_checked(txid, bin, 32);
             memcpy(tmp.txids_le[i], bin, 32); reverse_bytes(tmp.txids_le[i], 32);
-
-            // If "hash" is present, use it for wtxid. Else use txid.
-            if (hash) hex2bin_checked(hash, bin, 32);
-            else memcpy(bin, tmp.txids_le[i], 32); // Reuse txid if no separate hash
-            // Wait, logic check: hex2bin parsed big endian string to big endian bin.
-            // If hash provided, parse it. If NOT provided, use txid bin (which we need to re-parse or use raw).
-            if (hash) {
-                 hex2bin_checked(hash, bin, 32);
-                 memcpy(tmp.wtxids_le[i], bin, 32); reverse_bytes(tmp.wtxids_le[i], 32);
-            } else {
-                 memcpy(tmp.wtxids_le[i], tmp.txids_le[i], 32);
-            }
-
             tmp.tx_hexs[i] = strdup(data);
         }
     }
@@ -836,9 +711,10 @@ void bitcoin_update_template(bool force_clean) {
     json_t *dw = json_object_get(res, "default_witness_commitment");
     if (dw && json_is_string(dw)) dwc = json_string_value(dw);
 
-    // Determine SegWit status: if we have a default witness commitment, we MUST use segwit coinbase
+    // Determines if we need to do the SegWit dance on submit
     tmp.has_segwit = (dwc != NULL);
 
+    // BUILD LEGACY COINBASE FOR MINER (Includes commitment output, but no markers/witness stack)
     if (!build_coinbase_hex(tmp.height, tmp.coinbase_value, g_config.coinbase_tag,
                             tmp.has_segwit, dwc,
                             4, g_config.extranonce2_size,
@@ -862,7 +738,7 @@ void bitcoin_update_template(bool force_clean) {
     Template *curr = &g_jobs[g_job_head];
     bitcoin_free_job(curr);
     *curr = tmp;
-    template_zero(&tmp); // detach
+    template_zero(&tmp); 
     curr->valid = true;
     
     Template notify_snapshot;

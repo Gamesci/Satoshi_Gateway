@@ -31,7 +31,7 @@ typedef struct {
     // Internal
     uint32_t height;
     int64_t coinbase_value;
-    bool has_segwit; // Flag to indicate if we need SegWit reconstruction on submit
+    bool has_segwit; // 关键：指示提交时是否需要重组为 SegWit 格式
 
     // New: prevhash serialized for block header (32 bytes LE)
     uint8_t prevhash_le[32];

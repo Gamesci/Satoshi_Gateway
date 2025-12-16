@@ -74,6 +74,7 @@ static void div256_u64_be(uint8_t x[32], uint64_t div) {
     }
 }
 
+// Left shift for Big Endian 256-bit array
 static void shl256_be(uint8_t x[32], unsigned k) {
     if (k == 0) return;
     unsigned bytes = k / 8;
@@ -94,18 +95,47 @@ static void shl256_be(uint8_t x[32], unsigned k) {
     }
 }
 
+// Right shift for Big Endian 256-bit array (Fixed implementation)
+static void shr256_be(uint8_t x[32], unsigned k) {
+    if (k == 0) return;
+    unsigned bytes = k / 8;
+    unsigned bits = k % 8;
+    if (bytes >= 32) { memset(x, 0, 32); return; }
+
+    // Shift bytes right: move from low index (MSB) to high index (LSB)
+    if (bytes > 0) {
+        for (int i = 31; i >= 0; i--) {
+            int src = i - (int)bytes;
+            x[i] = (src >= 0) ? x[src] : 0;
+        }
+    }
+
+    // Shift bits right
+    if (bits > 0) {
+        uint8_t carry = 0;
+        for (int i = 0; i < 32; i++) {
+            uint8_t cur = x[i];
+            x[i] = (uint8_t)((cur >> bits) | (carry << (8 - bits)));
+            carry = cur; // carry original bits for next byte
+        }
+    }
+}
+
 static bool diff_to_target_be(double diff, uint8_t target_be[32]) {
     if (!(diff > 0.0) || !isfinite(diff)) return false;
     if (diff < 1.0) diff = 1.0;
     int e2 = 0;
     double m = frexp(diff, &e2);
+    // 2^64
     long double md = (long double)m;
     long double scaled = md * (long double)18446744073709551616.0L;
     uint64_t mant = (uint64_t)(scaled + 0.5L);
     if (mant == 0) mant = 1;
+
     uint8_t t[32];
     diff1_target_be(t);
     div256_u64_be(t, mant);
+
     int shift = 64 - e2;
     if (shift > 0) {
         if (shift > 255) shift = 255;
@@ -114,9 +144,10 @@ static bool diff_to_target_be(double diff, uint8_t target_be[32]) {
         int r = -shift;
         if (r > 255) memset(t, 0, 32);
         else {
-             memset(t, 0, 32);
+             shr256_be(t, (unsigned)r); // Fixed: Use proper right shift
         }
     }
+    // If target became 0 due to extreme diff, set to 1 (impossible hard but not 0)
     if (is_zero256_be(t)) t[31] = 1;
     memcpy(target_be, t, 32);
     return true;
@@ -161,7 +192,7 @@ static void backup_block_to_disk(const char *block_hex) {
     log_info("Block backup saved to %s", filename);
 }
 
-// ---------- CURL RPC ----------
+// ---------- CURL RPC (Improved Error Handling) ----------
 struct MemoryStruct { char *memory; size_t size; };
 
 static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp) {
@@ -211,22 +242,34 @@ static json_t* rpc_call(const char *method, json_t *params) {
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
 
     json_t *response = NULL;
-    if (res == CURLE_OK && http_code == 200) {
+
+    // Improved logic: Try to parse JSON if we got data, regardless of HTTP code
+    if (res == CURLE_OK && chunk.memory) {
         json_error_t err;
         response = json_loads(chunk.memory, 0, &err);
-        if (!response) log_error("RPC JSON parse error: %.200s", chunk.memory);
-        else {
+        
+        if (!response) {
+            // Only log parse error if it was supposed to be a successful call
+            // or if we really expected JSON but got garbage (like HTML error page)
+            if (http_code == 200) {
+                log_error("RPC JSON parse error: %.200s", chunk.memory);
+            } else {
+                log_error("RPC failed (HTTP %ld) and non-JSON body: %.200s", http_code, chunk.memory);
+            }
+        } else {
+            // Check for protocol-level errors inside JSON
             json_t *errf = json_object_get(response, "error");
             if (errf && !json_is_null(errf)) {
                 char *es = json_dumps(errf, JSON_COMPACT);
-                log_error("RPC error for %s: %s", method, es ? es : "(unprintable)");
+                log_error("RPC returned error for %s (HTTP %ld): %s", method, http_code, es ? es : "(unknown)");
                 free(es);
-                json_decref(response);
-                response = NULL;
+                // Keep the response object because some calls might want to see the error details
+            } else if (http_code != 200) {
+                log_error("RPC HTTP %ld for %s but no JSON error field", http_code, method);
             }
         }
     } else {
-        log_error("RPC %s failed: %s (HTTP %ld)", method, curl_easy_strerror(res), http_code);
+        log_error("RPC %s connection failed: %s", method, curl_easy_strerror(res));
     }
 
     free(post_data);
@@ -627,7 +670,7 @@ int bitcoin_validate_and_submit(const char *job_id,
             log_info("Block submitted successfully");
             result = 2;
         } else {
-            log_error("Block submission rejected/failed");
+            // Logs detailed error now thanks to rpc_call fix
             result = 1;
         }
         free(block_hex);

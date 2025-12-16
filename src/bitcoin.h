@@ -31,12 +31,18 @@ typedef struct {
     // Internal
     uint32_t height;
     int64_t coinbase_value;
+    bool has_segwit; // NEW: Flag to indicate if we need SegWit coinbase
 
     // New: prevhash serialized for block header (32 bytes LE)
     uint8_t prevhash_le[32];
 
-    // Non-coinbase txids in LITTLE-ENDIAN bytes
+    // Non-coinbase txids in LITTLE-ENDIAN bytes (for Block Header Merkle Root)
     uint8_t (*txids_le)[32];
+    
+    // Non-coinbase wtxids in LITTLE-ENDIAN bytes (for Witness Merkle Root)
+    // Note: If a tx is not SegWit, wtxid == txid.
+    uint8_t (*wtxids_le)[32];
+
     size_t tx_count;
 
     // For building block when found

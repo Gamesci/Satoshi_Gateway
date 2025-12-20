@@ -208,7 +208,8 @@ void stratum_send_mining_notify(int sock, Template *tmpl) {
     // remember last job_id for this client
     Client *c = client_find_by_sock(sock);
     if (c) {
-        snprintf(c->last_job_id, sizeof(c->last_job_id), "%s", tmpl->job_id ? tmpl->job_id : "");
+        // Fixed: removed invalid check (tmpl->job_id is an array)
+        snprintf(c->last_job_id, sizeof(c->last_job_id), "%s", tmpl->job_id);
     }
 
     json_t *p = json_array();

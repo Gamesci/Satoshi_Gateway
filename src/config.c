@@ -24,7 +24,8 @@ static void normalize_rpc_url(void) {
     if (strncmp(g_config.rpc_url, "http://", 7) == 0) return;
     if (strncmp(g_config.rpc_url, "https://", 8) == 0) return;
 
-    char tmp[256];
+    // Increased buffer size to 512 to prevent truncation warnings
+    char tmp[512];
     snprintf(tmp, sizeof(tmp), "http://%s", g_config.rpc_url);
     strncpy(g_config.rpc_url, tmp, sizeof(g_config.rpc_url) - 1);
     g_config.rpc_url[sizeof(g_config.rpc_url) - 1] = '\0';

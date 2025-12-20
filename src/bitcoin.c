@@ -421,20 +421,29 @@ static bool build_coinbase_hex(uint32_t height, int64_t value_sats,
     put_le32(tx_prefix + tp, 0xffffffffU); tp += 4;
     tp += encode_varint(tx_prefix + tp, (uint64_t)sp);
 
-    size_t en1_end = en_data_offset_in_script + (size_t)extranonce1_size;
-    size_t en2_end = en1_end + (size_t)extranonce2_size;
-    if (en2_end > sp) return false;
+    // FIXED: coinb1 must end exactly where the ExtraNonce data begins.
+    // The Stratum client/miner will append ExtraNonce1 + ExtraNonce2 here.
+    size_t split_point_1 = en_data_offset_in_script;
+    
+    // coinb2 must start exactly after ExtraNonce data ends.
+    // It will continue with the rest of scriptSig (e.g. pool tag).
+    size_t split_point_2 = split_point_1 + en_tot;
+
+    if (split_point_2 > sp) return false;
 
     uint8_t coinb1_bin[2048];
     size_t c1 = 0;
-    if (sizeof(coinb1_bin) < tp + en1_end) return false;
+    if (sizeof(coinb1_bin) < tp + split_point_1) return false;
+    
     memcpy(coinb1_bin + c1, tx_prefix, tp); c1 += tp;
-    memcpy(coinb1_bin + c1, scriptSig, en1_end); c1 += en1_end;
+    memcpy(coinb1_bin + c1, scriptSig, split_point_1); c1 += split_point_1;
 
     // --- Coinb2 (Legacy) ---
     uint8_t coinb2_bin[4096];
     size_t c2 = 0;
-    memcpy(coinb2_bin + c2, scriptSig + en2_end, sp - en2_end); c2 += (sp - en2_end);
+    memcpy(coinb2_bin + c2, scriptSig + split_point_2, sp - split_point_2); 
+    c2 += (sp - split_point_2);
+    
     put_le32(coinb2_bin + c2, 0xffffffffU); c2 += 4; // sequence
 
     // Outputs

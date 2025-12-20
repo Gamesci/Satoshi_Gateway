@@ -438,9 +438,10 @@ static bool build_coinbase_hex(uint32_t height, int64_t value_sats,
     put_le32(tx_prefix + tp, 0xffffffffU); tp += 4; // index
     tp += encode_varint(tx_prefix + tp, (uint64_t)sp); // Total ScriptSig Len
 
+    // FIX HERE: Declare coinb1_bin BEFORE using sizeof() check
+    uint8_t coinb1_bin[2048];
     if (sizeof(coinb1_bin) < tp + split_point_1) return false;
 
-    uint8_t coinb1_bin[2048];
     size_t c1 = 0;
     memcpy(coinb1_bin + c1, tx_prefix, tp); c1 += tp;
     memcpy(coinb1_bin + c1, scriptSig, split_point_1); c1 += split_point_1;

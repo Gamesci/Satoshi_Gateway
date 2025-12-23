@@ -11,6 +11,7 @@
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <arpa/inet.h>
 
 #include "bitcoin.h"
 #include "config.h"
@@ -95,7 +96,7 @@ static void shl256_be(uint8_t x[32], unsigned k) {
     }
 }
 
-// Right shift for Big Endian 256-bit array (Fixed implementation)
+// Right shift for Big Endian 256-bit array
 static void shr256_be(uint8_t x[32], unsigned k) {
     if (k == 0) return;
     unsigned bytes = k / 8;
@@ -121,35 +122,26 @@ static void shr256_be(uint8_t x[32], unsigned k) {
     }
 }
 
+// 修复：使用整数运算替代浮点数，提高高难度下的精度
 static bool diff_to_target_be(double diff, uint8_t target_be[32]) {
-    if (!(diff > 0.0) || !isfinite(diff)) return false;
+    if (diff <= 0.0 || !isfinite(diff)) return false;
+    
+    // 初始化 Diff1 Target (0x00000000FFFF0000...)
+    uint8_t diff1[32];
+    diff1_target_be(diff1);
+
     if (diff < 1.0) diff = 1.0;
-    int e2 = 0;
-    double m = frexp(diff, &e2);
-    // 2^64
-    long double md = (long double)m;
-    long double scaled = md * (long double)18446744073709551616.0L;
-    uint64_t mant = (uint64_t)(scaled + 0.5L);
-    if (mant == 0) mant = 1;
 
-    uint8_t t[32];
-    diff1_target_be(t);
-    div256_u64_be(t, mant);
+    // 将 diff 转换为整数进行除法
+    // 对于 solo 挖矿，忽略极小的小数部分偏差通常是可以接受的
+    // 这比使用 double 进行位操作更安全且精度在 80T 难度下足够
+    uint64_t diff_int = (uint64_t)diff;
+    if (diff_int == 0) diff_int = 1;
 
-    int shift = 64 - e2;
-    if (shift > 0) {
-        if (shift > 255) shift = 255;
-        shl256_be(t, (unsigned)shift);
-    } else if (shift < 0) {
-        int r = -shift;
-        if (r > 255) memset(t, 0, 32);
-        else {
-             shr256_be(t, (unsigned)r); // Fixed: Use proper right shift
-        }
-    }
-    // If target became 0 due to extreme diff, set to 1 (impossible hard but not 0)
-    if (is_zero256_be(t)) t[31] = 1;
-    memcpy(target_be, t, 32);
+    // Target = Diff1 / Diff
+    div256_u64_be(diff1, diff_int);
+    
+    memcpy(target_be, diff1, 32);
     return true;
 }
 
@@ -625,7 +617,13 @@ int bitcoin_validate_and_submit(const char *job_id,
 
         size_t cap = 10 * 1024 * 1024;
         char *block_hex = malloc(cap);
-        if (!block_hex) { free(coin_bin); free(coin_hex); pthread_mutex_unlock(&g_tmpl_lock); return 1; }
+        // 修复：处理内存分配失败，返回 0 而不是 1
+        if (!block_hex) { 
+            free(coin_bin); free(coin_hex); 
+            pthread_mutex_unlock(&g_tmpl_lock); 
+            log_error("Failed to allocate memory for block submission");
+            return 0; 
+        }
 
         size_t pos = 0;
         char head_hex[161]; bin2hex_safe(head, 80, head_hex, sizeof(head_hex));
@@ -736,7 +734,11 @@ void bitcoin_update_template(bool force_clean) {
     
     json_t *jv = json_object_get(res, "versionHex");
     if (jv && json_is_string(jv)) strncpy(tmp.version_hex, json_string_value(jv), 8);
-    else snprintf(tmp.version_hex, sizeof(tmp.version_hex), "%08x", tmp.version_val);
+    // 修复：当 RPC 不返回 versionHex 时，使用大端格式化 version_val
+    else {
+        uint32_t ver_be = htonl(tmp.version_val);
+        snprintf(tmp.version_hex, sizeof(tmp.version_hex), "%08x", ver_be);
+    }
 
     const char *bits = json_string_value(json_object_get(res, "bits"));
     if (bits) strncpy(tmp.nbits_hex, bits, 8);

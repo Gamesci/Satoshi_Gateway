@@ -11,7 +11,6 @@
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
-#include <arpa/inet.h>
 
 #include "bitcoin.h"
 #include "config.h"
@@ -133,8 +132,7 @@ static bool diff_to_target_be(double diff, uint8_t target_be[32]) {
     if (diff < 1.0) diff = 1.0;
 
     // 将 diff 转换为整数进行除法
-    // 对于 solo 挖矿，忽略极小的小数部分偏差通常是可以接受的
-    // 这比使用 double 进行位操作更安全且精度在 80T 难度下足够
+    // 避免浮点数尾数精度不足导致的目标值计算偏差
     uint64_t diff_int = (uint64_t)diff;
     if (diff_int == 0) diff_int = 1;
 
@@ -184,7 +182,7 @@ static void backup_block_to_disk(const char *block_hex) {
     log_info("Block backup saved to %s", filename);
 }
 
-// ---------- CURL RPC (Improved Error Handling) ----------
+// ---------- CURL RPC ----------
 struct MemoryStruct { char *memory; size_t size; };
 
 static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp) {
@@ -352,7 +350,6 @@ static size_t write_pushdata(uint8_t *dst, size_t cap, const uint8_t *data, size
     return 0;
 }
 
-// FIX: Explicitly handle ExtraNonce Opcode generation and splitting
 static bool build_coinbase_hex(uint32_t height, int64_t value_sats,
                                const char *tag,
                                bool is_segwit,
@@ -365,8 +362,6 @@ static bool build_coinbase_hex(uint32_t height, int64_t value_sats,
     if (extranonce1_size + extranonce2_size > 64) return false;
 
     // --- ScriptSig Construction ---
-    // Goal: [Height Push] [Height] [ExtraNonce Push Opcode] <SPLIT1> [Placeholder] <SPLIT2> [Tag Push] [Tag]
-
     uint8_t scriptSig[1024];
     size_t sp = 0;
 
@@ -399,8 +394,6 @@ static bool build_coinbase_hex(uint32_t height, int64_t value_sats,
     }
 
     // --- SPLIT POINT 1 (coinb1 ends here) ---
-    // The miner sees: coinb1 + EN1 + EN2 + coinb2
-    // coinb1 ends with the Push Opcode. The miner immediately appends the ExtraNonce data.
     size_t split_point_1 = sp; 
 
     // Write placeholder zeros for ExtraNonce (skipped in coinb2)
@@ -430,7 +423,6 @@ static bool build_coinbase_hex(uint32_t height, int64_t value_sats,
     put_le32(tx_prefix + tp, 0xffffffffU); tp += 4; // index
     tp += encode_varint(tx_prefix + tp, (uint64_t)sp); // Total ScriptSig Len
 
-    // FIX HERE: Declare coinb1_bin BEFORE using sizeof() check
     uint8_t coinb1_bin[2048];
     if (sizeof(coinb1_bin) < tp + split_point_1) return false;
 
@@ -734,11 +726,8 @@ void bitcoin_update_template(bool force_clean) {
     
     json_t *jv = json_object_get(res, "versionHex");
     if (jv && json_is_string(jv)) strncpy(tmp.version_hex, json_string_value(jv), 8);
-    // 修复：当 RPC 不返回 versionHex 时，使用大端格式化 version_val
-    else {
-        uint32_t ver_be = htonl(tmp.version_val);
-        snprintf(tmp.version_hex, sizeof(tmp.version_hex), "%08x", ver_be);
-    }
+    // 回退：恢复原始逻辑，直接格式化整数，不使用 htonl
+    else snprintf(tmp.version_hex, sizeof(tmp.version_hex), "%08x", tmp.version_val);
 
     const char *bits = json_string_value(json_object_get(res, "bits"));
     if (bits) strncpy(tmp.nbits_hex, bits, 8);

@@ -58,10 +58,6 @@ static void *zmq_thread(void *arg) {
                 bitcoin_update_template(true);
             }
             zmq_msg_close(&payload);
-
-            // 修复：消耗掉第三帧 (Sequence Number)
-            // Bitcoin ZMQ hashblock 消息是三帧的: [Topic] [Hash] [Sequence]
-            // 如果不读取，后续消息可能会错位
             zmq_msg_t seq;
             zmq_msg_init(&seq);
             zmq_msg_recv(&seq, subscriber, ZMQ_DONTWAIT);

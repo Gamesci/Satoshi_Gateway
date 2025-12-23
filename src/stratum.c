@@ -18,8 +18,8 @@
 static Client g_clients[MAX_CLIENTS];
 static pthread_mutex_t g_clients_lock = PTHREAD_MUTEX_INITIALIZER;
 
-// 64-bit share fingerprint cache (ring)
-#define SHARE_CACHE_SIZE 4096
+// 修复：扩大 Share 缓存以防止高难度下的哈希碰撞
+#define SHARE_CACHE_SIZE 65536
 static uint64_t g_share_cache[SHARE_CACHE_SIZE];
 static int g_share_head = 0;
 static pthread_mutex_t g_cache_lock = PTHREAD_MUTEX_INITIALIZER;

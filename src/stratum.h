@@ -5,10 +5,20 @@
 #include <stdbool.h>
 #include <pthread.h>
 #include <time.h>
+#include <jansson.h>
 #include "bitcoin.h"
 
 #define MAX_CLIENTS 1024
 #define STRATUM_JOBID_MAX 64
+
+// 新增：最近的 Share 记录
+typedef struct {
+    char worker_ex1[9];
+    double difficulty;
+    char share_hash[65];
+    time_t timestamp;
+    bool is_block; // 是否是爆块
+} ShareLog;
 
 typedef struct {
     int id;
@@ -18,20 +28,22 @@ typedef struct {
     bool is_authorized;
     pthread_t thread_id;
 
-    // extranonce1 fixed 4 bytes, hex length 8 + '\0'
     char extranonce1_hex[9];
-
-    // remember last job_id sent to this client
     char last_job_id[STRATUM_JOBID_MAX];
 
-    // VarDiff
     double current_diff;
     time_t last_retarget_time;
     int shares_in_window;
+    
+    double hashrate_est;
+    time_t last_submit_time;
+    uint64_t total_shares;
 } Client;
 
 void stratum_send_mining_notify(int sock, Template *tmpl);
 void stratum_broadcast_job(Template *tmpl);
 int stratum_start_thread(void);
+
+json_t* stratum_get_stats(void);
 
 #endif

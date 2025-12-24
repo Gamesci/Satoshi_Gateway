@@ -609,7 +609,6 @@ int bitcoin_validate_and_submit(const char *job_id,
 
         size_t cap = 10 * 1024 * 1024;
         char *block_hex = malloc(cap);
-        // 修复：处理内存分配失败，返回 0 而不是 1
         if (!block_hex) { 
             free(coin_bin); free(coin_hex); 
             pthread_mutex_unlock(&g_tmpl_lock); 
@@ -621,7 +620,7 @@ int bitcoin_validate_and_submit(const char *job_id,
         char head_hex[161]; bin2hex_safe(head, 80, head_hex, sizeof(head_hex));
         memcpy(block_hex + pos, head_hex, 160); pos += 160;
 
-        // FIXED: Transaction Count Varint Encoding
+        // Transaction Count Varint Encoding
         uint8_t vi[9];
         int vl = encode_varint(vi, (uint64_t)(1 + job->tx_count));
         char vi_hex[19]; 
@@ -629,14 +628,20 @@ int bitcoin_validate_and_submit(const char *job_id,
             memcpy(block_hex + pos, vi_hex, strlen(vi_hex)); 
             pos += strlen(vi_hex);
         } else {
-             // Fallback
              memcpy(block_hex + pos, "01", 2); pos += 2;
         }
 
         if (job->has_segwit) {
             // [Ver 4] [Marker 00] [Flag 01] [Body] [Witness] [Lock]
             
-            // 1. Version
+            // Safety check for splice
+            if (coin_bin_len < 8) {
+                free(block_hex); free(coin_bin); free(coin_hex);
+                pthread_mutex_unlock(&g_tmpl_lock);
+                return 0;
+            }
+
+            // 1. Version (first 4 bytes of coin_bin)
             char part[128];
             bin2hex_safe(coin_bin, 4, part, sizeof(part));
             memcpy(block_hex + pos, part, 8); pos += 8;
@@ -645,9 +650,14 @@ int bitcoin_validate_and_submit(const char *job_id,
             memcpy(block_hex + pos, "0001", 4); pos += 4;
             
             // 3. Body (InputCount...Outputs)
-            // Skip first 4 bytes (version) and last 4 bytes (locktime) of coin_bin
+            // Skip first 4 bytes (version) and last 4 bytes (locktime)
             size_t body_len = coin_bin_len - 8; 
             char *body_hex = malloc(body_len * 2 + 1);
+            if (!body_hex) {
+                 free(block_hex); free(coin_bin); free(coin_hex);
+                 pthread_mutex_unlock(&g_tmpl_lock);
+                 return 0;
+            }
             bin2hex_safe(coin_bin + 4, body_len, body_hex, body_len * 2 + 1);
             memcpy(block_hex + pos, body_hex, strlen(body_hex)); pos += strlen(body_hex);
             free(body_hex);
@@ -657,7 +667,7 @@ int bitcoin_validate_and_submit(const char *job_id,
             memcpy(block_hex + pos, "01200000000000000000000000000000000000000000000000000000000000000000", 68);
             pos += 68;
             
-            // 5. Locktime
+            // 5. Locktime (last 4 bytes)
             bin2hex_safe(coin_bin + coin_bin_len - 4, 4, part, sizeof(part));
             memcpy(block_hex + pos, part, 8); pos += 8;
             
@@ -726,7 +736,6 @@ void bitcoin_update_template(bool force_clean) {
     
     json_t *jv = json_object_get(res, "versionHex");
     if (jv && json_is_string(jv)) strncpy(tmp.version_hex, json_string_value(jv), 8);
-    // 回退：恢复原始逻辑，直接格式化整数，不使用 htonl
     else snprintf(tmp.version_hex, sizeof(tmp.version_hex), "%08x", tmp.version_val);
 
     const char *bits = json_string_value(json_object_get(res, "bits"));

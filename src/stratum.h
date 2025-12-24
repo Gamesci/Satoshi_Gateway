@@ -11,13 +11,13 @@
 #define MAX_CLIENTS 1024
 #define STRATUM_JOBID_MAX 64
 
-// 新增：最近的 Share 记录
+// ShareLog 结构 (用于 Last Shares 列表)
 typedef struct {
     char worker_ex1[9];
     double difficulty;
     char share_hash[65];
     time_t timestamp;
-    bool is_block; // 是否是爆块
+    bool is_block; 
 } ShareLog;
 
 typedef struct {
@@ -35,9 +35,13 @@ typedef struct {
     time_t last_retarget_time;
     int shares_in_window;
     
+    // Stats
     double hashrate_est;
     time_t last_submit_time;
     uint64_t total_shares;
+    
+    // New: 记录该 worker 连接期间的最佳 Share 难度
+    double best_diff; 
 } Client;
 
 void stratum_send_mining_notify(int sock, Template *tmpl);

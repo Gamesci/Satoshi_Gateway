@@ -4,7 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
-#include <jansson.h> 
+#include <jansson.h>
 
 #define MAX_JOB_HISTORY 16
 
@@ -51,14 +51,16 @@ void bitcoin_update_template(bool force_clean);
 bool bitcoin_get_latest_job(Template *out);
 void bitcoin_free_job(Template *t);
 
+// 修改：增加 share_diff 参数用于传出实际难度
 int bitcoin_validate_and_submit(const char *job_id,
                                 const char *full_extranonce_hex,
                                 const char *ntime_hex,
                                 uint32_t nonce,
                                 uint32_t version_bits,
-                                double diff);
+                                double diff,
+                                double *share_diff); // <--- 新增参数
 
-// 新增：获取当前的区块元数据供 API 使用
+// 获取当前的区块元数据供 API 使用
 void bitcoin_get_telemetry(uint32_t *height, int64_t *reward, uint32_t *difficulty);
 
 #endif

@@ -54,6 +54,15 @@ static void nbits_to_target_be(uint32_t nbits, uint8_t target_be[32]) {
     target_be[idx + 2] = mant & 0xff;
 }
 
+// 新增：将 nbits 转换为 diff (近似值)
+static double nbits_to_diff(uint32_t nbits) {
+    int shift = (nbits >> 24) & 0xff;
+    double diff = (double)0x0000ffff / (double)(nbits & 0x00ffffff);
+    while (shift < 29) { diff *= 256.0; shift++; }
+    while (shift > 29) { diff /= 256.0; shift--; }
+    return diff;
+}
+
 static void diff1_target_be(uint8_t out[32]) {
     memset(out, 0, 32);
     out[4] = 0xff; out[5] = 0xff; out[6] = 0x00; out[7] = 0x00;
@@ -121,7 +130,6 @@ static void shr256_be(uint8_t x[32], unsigned k) {
     }
 }
 
-// 修复：使用整数运算替代浮点数，提高高难度下的精度
 static bool diff_to_target_be(double diff, uint8_t target_be[32]) {
     if (diff <= 0.0 || !isfinite(diff)) return false;
     
@@ -132,7 +140,6 @@ static bool diff_to_target_be(double diff, uint8_t target_be[32]) {
     if (diff < 1.0) diff = 1.0;
 
     // 将 diff 转换为整数进行除法
-    // 避免浮点数尾数精度不足导致的目标值计算偏差
     uint64_t diff_int = (uint64_t)diff;
     if (diff_int == 0) diff_int = 1;
 
@@ -814,4 +821,20 @@ void bitcoin_update_template(bool force_clean) {
     bitcoin_free_job(&notify_snapshot);
 
     json_decref(resp);
+}
+
+// 新增实现
+void bitcoin_get_telemetry(uint32_t *height, int64_t *reward, uint32_t *difficulty) {
+    pthread_mutex_lock(&g_tmpl_lock);
+    const Template *curr = &g_jobs[g_job_head];
+    if (curr->valid) {
+        if (height) *height = curr->height;
+        if (reward) *reward = curr->coinbase_value;
+        if (difficulty) *difficulty = (uint32_t)nbits_to_diff(curr->nbits_val);
+    } else {
+        if (height) *height = 0;
+        if (reward) *reward = 0;
+        if (difficulty) *difficulty = 0;
+    }
+    pthread_mutex_unlock(&g_tmpl_lock);
 }

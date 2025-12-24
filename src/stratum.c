@@ -7,6 +7,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <errno.h>
+#include <sys/time.h>
 #include <jansson.h>
 #include <ctype.h>
 
@@ -57,6 +58,21 @@ static void init_clients(void) {
 }
 
 static Client* client_add(int sock, struct sockaddr_in addr) {
+    // [CRITICAL FIX] Set Send Timeout to prevent blocking the broadcast thread
+    // If a miner hangs, we don't want the whole pool to freeze.
+    struct timeval tv;
+    tv.tv_sec = 2; // 2 seconds send timeout
+    tv.tv_usec = 0;
+    if (setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv)) < 0) {
+        log_error("Failed to set SO_SNDTIMEO on client socket");
+        // We continue anyway, but log the warning
+    }
+
+    // Set Receive Timeout (Keep-Alive logic handled by worker read loop)
+    tv.tv_sec = 600; // 10 minutes read timeout
+    tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+
     pthread_mutex_lock(&g_clients_lock);
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (!g_clients[i].active) {
@@ -105,7 +121,13 @@ static void send_json(int sock, json_t *response) {
     memcpy(m, s, l);
     m[l] = '\n';
     m[l + 1] = '\0';
-    (void)send(sock, m, l + 1, MSG_NOSIGNAL);
+    
+    // Check return value to catch disconnects early, though worker handles logic
+    ssize_t sent = send(sock, m, l + 1, MSG_NOSIGNAL);
+    if (sent < 0) {
+        // Logging here might be noisy on disconnects
+    }
+
     free(m);
     free(s);
 }
@@ -207,7 +229,6 @@ void stratum_send_mining_notify(int sock, Template *tmpl) {
     // remember last job_id for this client
     Client *c = client_find_by_sock(sock);
     if (c) {
-        // Fixed: removed invalid check (tmpl->job_id is an array)
         snprintf(c->last_job_id, sizeof(c->last_job_id), "%s", tmpl->job_id);
     }
 
@@ -261,10 +282,7 @@ static void *client_worker(void *arg) {
 
     log_info("Worker connected: ID=%d IP=%s", c->id, inet_ntoa(c->addr.sin_addr));
 
-    struct timeval tv;
-    tv.tv_sec = 600;
-    tv.tv_usec = 0;
-    setsockopt(c->sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
+    // NOTE: RCVTIMEO is now set in client_add to ensure consistency
 
     while (c->active) {
         ssize_t n = recv(c->sock, buf + rpos, sizeof(buf) - 1 - rpos, 0);

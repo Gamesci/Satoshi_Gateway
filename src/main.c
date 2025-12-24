@@ -10,6 +10,7 @@
 #include "stratum.h"
 #include "utils.h"
 #include "zmq_listener.h"
+#include "web.h"
 
 volatile sig_atomic_t g_block_notify = 0;
 static void handle_signal(int sig) { if (sig == SIGUSR1) g_block_notify = 1; }
@@ -36,8 +37,11 @@ int main(int argc, char *argv[]) {
     if (stratum_start_thread() != 0) return 1;
 
     zmq_listener_start();
+    
+    // 启动 Web 面板，端口固定 8080
+    web_server_start(8080); 
 
-    log_info("Gateway ready on port %d", g_config.stratum_port);
+    log_info("Gateway ready on stratum port %d", g_config.stratum_port);
 
     bitcoin_update_template(true);
     time_t last_check = time(NULL);

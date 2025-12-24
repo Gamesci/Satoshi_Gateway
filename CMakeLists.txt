@@ -12,6 +12,7 @@ add_executable(satoshi_gateway
     src/stratum.c
     src/bitcoin.c
     src/zmq_listener.c
+    src/web.c
 )
 
 # Warnings / flags

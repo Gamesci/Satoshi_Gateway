@@ -25,15 +25,13 @@ static uint64_t g_share_cache[SHARE_CACHE_SIZE];
 static int g_share_head = 0;
 static pthread_mutex_t g_cache_lock = PTHREAD_MUTEX_INITIALIZER;
 
-// --- 新增：历史数据存储 ---
 #define MAX_SHARE_LOGS 50
-#define HISTORY_POINTS 60 // 保存最近60分钟的算力点
+#define HISTORY_POINTS 60 
 
 static ShareLog g_share_logs[MAX_SHARE_LOGS];
 static int g_share_log_head = 0;
 static pthread_mutex_t g_stats_lock = PTHREAD_MUTEX_INITIALIZER;
 
-// 简单的算力历史 (每分钟存一个点)
 static double g_hashrate_history[HISTORY_POINTS]; 
 static time_t g_last_history_update = 0;
 
@@ -57,22 +55,17 @@ static void update_global_hashrate_history(double total_hashrate) {
     pthread_mutex_lock(&g_stats_lock);
     if (g_last_history_update == 0) g_last_history_update = now;
     
-    // 如果过去了60秒，移动数组并插入新点
     if (now - g_last_history_update >= 60) {
-        // Shift left
         for (int i = 0; i < HISTORY_POINTS - 1; i++) {
             g_hashrate_history[i] = g_hashrate_history[i+1];
         }
         g_hashrate_history[HISTORY_POINTS - 1] = total_hashrate;
         g_last_history_update = now;
     } else {
-        // 还没到一分钟，更新当前最新的点（平滑一下）
-        // 简单策略：直接更新为当前值
         g_hashrate_history[HISTORY_POINTS - 1] = total_hashrate;
     }
     pthread_mutex_unlock(&g_stats_lock);
 }
-// -----------------------
 
 static uint64_t fnv1a64(const void *data, size_t len) {
     const uint8_t *p = (const uint8_t*)data;
@@ -133,10 +126,10 @@ static Client* client_add(int sock, struct sockaddr_in addr) {
             c->last_retarget_time = time(NULL);
             c->shares_in_window = 0;
             
-            // Stats Init
             c->hashrate_est = 0.0;
             c->last_submit_time = time(NULL);
             c->total_shares = 0;
+            c->best_diff = 0.0; // Init best diff
 
             snprintf(c->extranonce1_hex, sizeof(c->extranonce1_hex), "%08x", (uint32_t)c->id);
             c->last_job_id[0] = '\0';
@@ -174,9 +167,7 @@ static void send_json(int sock, json_t *response) {
     m[l + 1] = '\0';
     
     ssize_t sent = send(sock, m, l + 1, MSG_NOSIGNAL);
-    if (sent < 0) {
-        // Logging here might be noisy
-    }
+    if (sent < 0) {}
 
     free(m);
     free(s);
@@ -235,9 +226,7 @@ static void parse_nonce_auto(const char *s,
             if (val_hex) *val_hex = (uint32_t)v;
         }
     }
-
     if (has_hex_alpha) return;
-
     if (is_all_digits(s)) {
         char *end = NULL;
         unsigned long v = strtoul(s, &end, 10);
@@ -320,12 +309,15 @@ void stratum_broadcast_job(Template *tmpl) {
     if (count > 0) log_info("Broadcast job %s to %d miners", tmpl->job_id, count);
 }
 
-// 新增：导出 API 数据
 json_t* stratum_get_stats(void) {
     json_t *root = json_object();
     json_t *workers = json_array();
-    
     double total_hashrate = 0;
+
+    // --- 计算全局 Best Share (Session) ---
+    double global_best_diff = 0;
+    char global_best_worker[16] = {0};
+    // ------------------------------------
 
     pthread_mutex_lock(&g_clients_lock);
     for (int i = 0; i < MAX_CLIENTS; i++) {
@@ -340,16 +332,21 @@ json_t* stratum_get_stats(void) {
             json_object_set_new(w, "last_seen", json_integer((long)g_clients[i].last_submit_time));
             json_array_append_new(workers, w);
             total_hashrate += g_clients[i].hashrate_est;
+
+            // 检查是否是当前在线的最佳成绩
+            if (g_clients[i].best_diff > global_best_diff) {
+                global_best_diff = g_clients[i].best_diff;
+                snprintf(global_best_worker, sizeof(global_best_worker), "%s", g_clients[i].extranonce1_hex);
+            }
         }
     }
     pthread_mutex_unlock(&g_clients_lock);
     
-    // 更新历史算力
     update_global_hashrate_history(total_hashrate);
 
     json_object_set_new(root, "workers", workers);
 
-    // 1. Block Info
+    // 1. Block Info & Best Share Info
     uint32_t height = 0;
     int64_t reward = 0;
     uint32_t net_diff = 0;
@@ -359,6 +356,12 @@ json_t* stratum_get_stats(void) {
     json_object_set_new(blk, "height", json_integer(height));
     json_object_set_new(blk, "reward", json_integer(reward));
     json_object_set_new(blk, "net_diff", json_real((double)net_diff));
+    
+    // --- 将最佳 Share 信息也放入 block_info 或者单独字段 ---
+    json_object_set_new(blk, "best_diff", json_real(global_best_diff));
+    json_object_set_new(blk, "best_worker", json_string(global_best_worker));
+    // ----------------------------------------------------
+    
     json_object_set_new(root, "block_info", blk);
 
     // 2. Share Logs
@@ -412,7 +415,6 @@ static void *client_worker(void *arg) {
                 if (req) {
                     const char *m = json_string_value(json_object_get(req, "method"));
                     json_t *id = json_object_get(req, "id");
-
                     json_t *res = json_object();
                     if (id) json_object_set(res, "id", id);
                     else json_object_set_new(res, "id", json_null());
@@ -506,14 +508,15 @@ static void *client_worker(void *arg) {
 
                         const char *jid_used = jid;
                         int ret = 0;
+                        double actual_share_diff = 0.0; // <--- 保存真实难度
 
-                        if (ok_dec) ret = bitcoin_validate_and_submit(jid, full_extranonce, nt, nonce_dec, version_bits, c->current_diff);
-                        if (ret == 0 && ok_hex) ret = bitcoin_validate_and_submit(jid, full_extranonce, nt, nonce_hex, version_bits, c->current_diff);
+                        if (ok_dec) ret = bitcoin_validate_and_submit(jid, full_extranonce, nt, nonce_dec, version_bits, c->current_diff, &actual_share_diff);
+                        if (ret == 0 && ok_hex) ret = bitcoin_validate_and_submit(jid, full_extranonce, nt, nonce_hex, version_bits, c->current_diff, &actual_share_diff);
 
                         if (ret == 0 && c->last_job_id[0] && strcmp(c->last_job_id, jid) != 0) {
                             jid_used = c->last_job_id;
-                            if (ok_dec) ret = bitcoin_validate_and_submit(jid_used, full_extranonce, nt, nonce_dec, version_bits, c->current_diff);
-                            if (ret == 0 && ok_hex) ret = bitcoin_validate_and_submit(jid_used, full_extranonce, nt, nonce_hex, version_bits, c->current_diff);
+                            if (ok_dec) ret = bitcoin_validate_and_submit(jid_used, full_extranonce, nt, nonce_dec, version_bits, c->current_diff, &actual_share_diff);
+                            if (ret == 0 && ok_hex) ret = bitcoin_validate_and_submit(jid_used, full_extranonce, nt, nonce_hex, version_bits, c->current_diff, &actual_share_diff);
                         }
 
                         char keybuf[256];
@@ -531,21 +534,25 @@ static void *client_worker(void *arg) {
                             json_object_set_new(res, "result", json_true());
                             json_object_set_new(res, "error", json_null());
 
-                            // Stats Update
                             c->shares_in_window++;
                             c->total_shares++;
                             time_t now = time(NULL);
                             c->last_submit_time = now;
                             
+                            // 更新 Personal Best
+                            if (actual_share_diff > c->best_diff) {
+                                c->best_diff = actual_share_diff;
+                            }
+
                             double share_work = c->current_diff * 4294967296.0;
                             double dt_est = difftime(now, c->last_retarget_time);
                             if (dt_est < 1.0) dt_est = 1.0;
-                            
                             double instant_hr = share_work / dt_est * c->shares_in_window;
                             if (c->hashrate_est == 0) c->hashrate_est = instant_hr;
                             else c->hashrate_est = c->hashrate_est * 0.95 + instant_hr * 0.05;
 
-                            record_share(c->extranonce1_hex, c->current_diff, "Valid Share", (ret == 2));
+                            // 记录日志时使用真实难度
+                            record_share(c->extranonce1_hex, actual_share_diff, "Valid Share", (ret == 2));
 
                             double dt = difftime(now, c->last_retarget_time);
                             if (dt >= 60.0) {
@@ -595,7 +602,6 @@ static void *client_worker(void *arg) {
             rpos = 0;
         }
     }
-
     client_remove(c);
     return NULL;
 }
@@ -605,23 +611,17 @@ static void *server_thread(void *arg) {
     int sfd;
     struct sockaddr_in addr;
     int opt = 1;
-
     init_clients();
-
     sfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sfd < 0) exit(1);
     if (setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) != 0) exit(1);
-
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons((uint16_t)g_config.stratum_port);
-
     if (bind(sfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) exit(1);
     if (listen(sfd, 64) < 0) exit(1);
-
     log_info("Stratum server listening on port %d", g_config.stratum_port);
-
     while (1) {
         struct sockaddr_in c_addr;
         socklen_t l = sizeof(c_addr);

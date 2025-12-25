@@ -319,8 +319,17 @@ json_t* stratum_get_stats(void) {
     json_t *workers = json_array();
     double total_hashrate = 0;
 
-    double global_best_diff = 0;
-    char global_best_worker[16] = {0};
+    // 定义用于排序的简单结构
+    struct BestShare {
+        double diff;
+        char worker[16];
+    } top3[3];
+    
+    // 初始化
+    for(int k=0; k<3; k++) { 
+        top3[k].diff = 0.0; 
+        memset(top3[k].worker, 0, sizeof(top3[k].worker)); 
+    }
 
     pthread_mutex_lock(&g_clients_lock);
     for (int i = 0; i < MAX_CLIENTS; i++) {
@@ -336,9 +345,23 @@ json_t* stratum_get_stats(void) {
             json_array_append_new(workers, w);
             total_hashrate += g_clients[i].hashrate_est;
 
-            if (g_clients[i].best_diff > global_best_diff) {
-                global_best_diff = g_clients[i].best_diff;
-                snprintf(global_best_worker, sizeof(global_best_worker), "%s", g_clients[i].extranonce1_hex);
+            // 维护 Top 3 Best Diff 逻辑
+            if (g_clients[i].best_diff > 0) {
+                double d = g_clients[i].best_diff;
+                char *n = g_clients[i].extranonce1_hex;
+                
+                for (int k = 0; k < 3; k++) {
+                    if (d > top3[k].diff) {
+                        // 插入位置 k，将后面的元素后移
+                        for (int m = 2; m > k; m--) {
+                            top3[m] = top3[m-1];
+                        }
+                        top3[k].diff = d;
+                        strncpy(top3[k].worker, n, 15);
+                        top3[k].worker[15] = '\0';
+                        break;
+                    }
+                }
             }
         }
     }
@@ -357,8 +380,19 @@ json_t* stratum_get_stats(void) {
     json_object_set_new(blk, "height", json_integer(height));
     json_object_set_new(blk, "reward", json_integer(reward));
     json_object_set_new(blk, "net_diff", json_real((double)net_diff));
-    json_object_set_new(blk, "best_diff", json_real(global_best_diff));
-    json_object_set_new(blk, "best_worker", json_string(global_best_worker));
+    
+    // 构建 Top 3 数组并放入 JSON
+    json_t *top_shares_json = json_array();
+    for (int k = 0; k < 3; k++) {
+        if (top3[k].diff > 0) {
+            json_t *item = json_object();
+            json_object_set_new(item, "worker", json_string(top3[k].worker));
+            json_object_set_new(item, "diff", json_real(top3[k].diff));
+            json_array_append_new(top_shares_json, item);
+        }
+    }
+    json_object_set_new(blk, "best_shares", top_shares_json);
+
     json_object_set_new(root, "block_info", blk);
 
     json_t *logs = json_array();

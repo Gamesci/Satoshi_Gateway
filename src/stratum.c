@@ -40,7 +40,8 @@ static time_t g_last_history_update = 0;
 static void record_share(const char *ex1, double diff, const char *hash, bool is_block) {
     pthread_mutex_lock(&g_stats_lock);
     int idx = g_share_log_head;
-    strncpy(g_share_logs[idx].worker_ex1, ex1, 8);
+    // Fix: use memcpy instead of strncpy to avoid truncation warning
+    memcpy(g_share_logs[idx].worker_ex1, ex1, 8);
     g_share_logs[idx].worker_ex1[8] = 0;
     g_share_logs[idx].difficulty = diff;
     strncpy(g_share_logs[idx].share_hash, hash, 64);

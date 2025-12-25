@@ -7,7 +7,7 @@
 
 #define MAX_JOB_HISTORY 16
 
-// [FIX] 支持多版本 Coinbase 以兼容不同矿机
+// 支持多版本 Coinbase 以兼容不同矿机
 #define MAX_COINBASE_VARIANTS 3
 #define CB_VARIANT_DEFAULT 0
 #define CB_VARIANT_WHATSMINER 1
@@ -39,16 +39,14 @@ typedef struct {
     char **tx_hexs;
     
     // Merkle Branch 
-    // 注意：所有 Variant 共用同一套 Merkle Branch（因为 Coinbase 都在 index 0）
     size_t merkle_count;
-    char **merkle_branch; // [FIX] 存储为 Big Endian Hex 字符串，符合 Stratum 协议
+    char **merkle_branch; // Little Endian Hex Strings
     
-    // Coinbase Info (Global)
+    // Coinbase Info
     int64_t coinbase_value;
     bool has_segwit;
     
-    // [FIX] 多版本 Coinbase 支持
-    // coinb1/coinb2 针对不同矿机类型生成不同内容（如填充数据）
+    // Multi-Variant Coinbase
     char coinb1[MAX_COINBASE_VARIANTS][4096];
     char coinb2[MAX_COINBASE_VARIANTS][4096];
     
@@ -66,6 +64,7 @@ int bitcoin_validate_and_submit(const char *job_id,
                                 double diff,
                                 double *share_diff);
 
-void bitcoin_get_telemetry(uint32_t *height, int64_t *reward, uint32_t *difficulty);
+// [FIX] difficulty changed to double to prevent INT overflow on Web UI
+void bitcoin_get_telemetry(uint32_t *height, int64_t *reward, double *difficulty);
 
 #endif

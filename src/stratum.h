@@ -11,7 +11,7 @@
 #define MAX_CLIENTS 1024
 #define STRATUM_JOBID_MAX 64
 
-// ShareLog 结构 (用于 Last Shares 列表)
+// ShareLog Structure (for Last Shares)
 typedef struct {
     char worker_ex1[9];
     double difficulty;
@@ -40,7 +40,7 @@ typedef struct {
     time_t last_submit_time;
     uint64_t total_shares;
     
-    // New: 记录该 worker 连接期间的最佳 Share 难度
+    // Track Best Share Difficulty per Worker
     double best_diff; 
 } Client;
 

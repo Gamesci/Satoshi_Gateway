@@ -1,121 +1,160 @@
 
 # Satoshi Gateway
 
-**Satoshi Gateway** 是一个轻量级、开源的比特币 Stratum 挖矿网关，专为**家庭矿工**（Home Miners）和**独立挖矿**（Solo Mining）设计。
+**Satoshi Gateway** 是一个轻量级、开源且高性能的比特币 Stratum 挖矿网关，专为**家庭矿工**（Home Miners）和**独立挖矿**（Solo Mining）设计。
 
-它充当比特币全节点（Bitcoin Core）与矿机之间的桥梁，通过 Stratum V1 协议将矿机连接到主网，支持从微型矿机（如 ESP32/NerdMiner）到高性能家用 ASIC（如 Bitaxe）的多种设备。
+它充当比特币全节点（Bitcoin Core）与矿机之间的桥梁，通过 Stratum V1 协议将矿机连接到主网。项目采用 C 语言编写，极度轻量，完美支持从微型矿机（ESP32/NerdMiner）到大算力 ASIC（Bitaxe, Whatsminer, Antminer）的多种设备。
 
-> **注意**：本项目定位为 MVP（最小可行性产品），旨在提供清晰、易读且功能完备的代码库，适合学习比特币协议或搭建私人矿池。如果您需要承载数万台矿机的大型矿池方案，建议参考 [Datum Gateway](https://github.com/OCEAN-xyz/datum_gateway)。
-建议：为了避免混淆，建议将矿机上的地址也设置为与 config.json 一致，影响实际挖矿和收益归属。
-风险提示：务必仔细检查 config.json 中的 reward_address，这才是唯一决定btc去哪里的配置。
+> **⚠️ 风险提示**：Solo 挖矿是一项高风险高回报的活动。请务必仔细检查 `config.json` 中的 `reward_address`，这是决定出块奖励归属的唯一配置。建议将矿机后台的 Worker 名称也设置为您的钱包地址以便区分，但最终收益取决于网关配置。
 
-## 核心特性
+## ✨ 核心特性
 
-  * **完全兼容主网**：正确实现 GBT (GetBlockTemplate) 协议，支持 SegWit (隔离见证) 和 BIP34 高度编码。
-  * **Stratum V1 协议**：支持标准的挖矿协议，兼容市面上绝大多数矿机。
-  * **ASICBoost 支持**：实现 Version Rolling 扩展，完美支持 Bitaxe 等现代 ASIC 设备的高效挖矿。
-  * **VarDiff (动态难度)**：自动根据算力调整难度，确保从 50KH/s 到 100TH/s 的设备均可稳定连接。
-  * **ZMQ 极速响应**：通过监听 Bitcoin Core 的 ZMQ 接口，毫秒级感知新区块诞生。
-  * **轻量级架构**：代码精简（C语言），依赖少，适合部署在树莓派、闲置 PC 或云服务器上。
+* **⚡️ 广泛的硬件兼容性**：
+    * **ASICBoost**: 支持 Version Rolling 扩展，完美适配 **Bitaxe** 等开源矿机。
+    * **Whatsminer 修正**: 内置针对神马矿机（Whatsminer）的特殊兼容处理，修复了 Coinbase 长度问题，确保算力不浪费。
+    * **多版本 Coinbase**: 智能识别 User-Agent，自动适配不同厂商（Standard, NiceHash, Whatsminer）的协议细节。
+* **📊 实时 Web 监控面板**：
+    * 内置轻量级 HTTP 服务器（默认端口 8080）。
+    * 实时查看总算力、活跃矿机列表（显示 User-Agent/型号）、最近提交的 Share 记录。
+    * 可视化算力曲线图。
+* **🛠 标准 Stratum V1 协议**：支持标准的挖矿协议，兼容市面上绝大多数矿机。
+* **⚖️ VarDiff (动态难度)**：自动根据矿机算力调整难度，确保从 50KH/s (ESP32) 到 100TH/s (ASIC) 的设备均可稳定连接。
+* **🚀 ZMQ 极速响应**：通过监听 Bitcoin Core 的 ZMQ 接口，毫秒级感知新区块诞生，减少空块率。
+* **🪶 极简架构**：C 语言编写，依赖极少，适合部署在树莓派、闲置 PC 或云服务器上。
 
-## 支持的硬件
+## 🔌 支持的硬件
 
-Satoshi Gateway 经过测试，特别适合以下开源硬件：
+Satoshi Gateway 经过测试，支持以下设备：
 
-  * **Bitaxe** (推荐): 基于 BM1366 等芯片的开源 ASIC 矿机。支持 Overt ASICBoost，运行极其稳定。
-  * **NerdMiner / ESP32**: 基于微控制器的教学级矿机（需调整难度配置，见下文）。
-  * **传统 ASIC**: 如 Antminer S9/S19 等（仅限小规模部署）。
+* **Bitaxe (Ultra/Gamma/Supra)**: 基于 BM1366 等芯片的开源 ASIC 矿机（推荐）。
+* **Whatsminer (神马矿机)**: M20/M30/M50/M60 等系列（已修复协议兼容性）。
+* **NerdMiner / ESP32**: 教学级微型矿机（需调整难度配置）。
+* **Antminer (蚂蚁矿机)**: S9/S19 等支持 Stratum V1 的机型。
 
-## 安装与编译
+## 🚀 安装与部署
 
-### 依赖项
+### 方式一：使用 Docker (推荐)
 
-你需要安装 `cmake`, `libcurl`, `jansson` 和 `libzmq`。
+如果您熟悉 Docker，这是最快启动的方式。
 
-**Ubuntu/Debian:**
+1.  **构建镜像**：
+    ```bash
+    docker build -t satoshi-gateway .
+    ```
 
+2.  **准备配置文件**：
+    在当前目录创建 `config.json` (参考下文配置说明)。
+
+3.  **运行容器**：
+    ```bash
+    docker run -d \
+      --name sgw \
+      --net=host \
+      -v $(pwd)/config.json:/app/config.json \
+      -v $(pwd)/backup:/app/backup \
+      satoshi-gateway
+    ```
+    *注意：使用 `--net=host` 是为了方便连接本地 Bitcoin Core 的 ZMQ 和 RPC，并暴露 3333/8080 端口。*
+
+### 方式二：源码编译
+
+**依赖项 (Ubuntu/Debian):**
 ```bash
 sudo apt-get update
-sudo apt-get install -y build-essential cmake libcurl4-openssl-dev libjansson-dev libzmq3-dev git
+sudo apt-get install -y build-essential cmake libcurl4-openssl-dev libjansson-dev libzmq3-dev git pkg-config
+
 ```
 
-### 编译步骤
+**编译步骤:**
 
 ```bash
-git clone https://github.com/your-repo/satoshi_gateway.git
+# 1. 克隆代码
+git clone [https://github.com/your-repo/satoshi_gateway.git](https://github.com/your-repo/satoshi_gateway.git)
 cd satoshi_gateway
+
+# 2. 编译
 mkdir build && cd build
 cmake ..
-make
+make -j$(nproc)
+
+# 3. 运行
+./satoshi_gateway -c ../config.json
+
 ```
 
-## 配置说明
+## ⚙️ 配置说明
 
-在运行之前，请复制 `config.json` 并根据你的环境进行修改。
+在运行之前，请复制并修改 `config.json`：
 
 ```json
 {
-  "rpc_url": "http://127.0.0.1:8332",    // 比特币节点的 RPC 地址
+  "rpc_url": "[http://127.0.0.1:8332](http://127.0.0.1:8332)",    // 比特币节点的 RPC 地址
   "rpc_user": "your_rpc_user",           // RPC 用户名
   "rpc_pass": "your_rpc_password",       // RPC 密码
-  "zmq_pub_hashblock": "tcp://127.0.0.1:28332", // ZMQ 监听地址 (必须与比特币节点配置一致)
+  "zmq_pub_hashblock": "tcp://127.0.0.1:28332", // ZMQ 监听地址 (必须与比特币节点一致)
   
   "reward_address": "bc1q...",           // 【重要】你的比特币钱包地址，用于接收挖矿奖励
   "pool_tag": "/SatoshiGateway/",        // Coinbase 中的个性化标签
   
   "listen_port": 3333,                   // Stratum 服务监听端口
+  "poll_interval": 30,                   // RPC 轮询间隔 (秒)
   
   "diff_asic": 1024,                     // 起始难度 (重要，见下文硬件适配)
-  "vardiff_target_shares_min": 5,       // VarDiff 目标每分钟提交的 Share 数量
-  "extranonce2_size": 8                 // 矿工在为矿池工作时修改的额外 nonce
+  "vardiff_target_shares_min": 6,        // VarDiff 目标每分钟提交的 Share 数量
+  "extranonce2_size": 8,                 // ExtraNonce2 长度
+  "version_mask": "1fffe000"             // ASICBoost Version Rolling Mask
 }
+
 ```
 
-### 针对不同硬件的配置建议
+### 针对不同硬件的配置建议 (`diff_asic`)
 
-  * **Bitaxe (ASIC)**:
+* **Bitaxe / Whatsminer / Antminer**:
+* 推荐设置: **1024** 或更高 (如 4096)。
+* 说明: ASIC 算力较强，高起始难度可减少握手初期的网络流量。
 
-      * 保持默认配置 `diff_asic`: **1024** 或更高。
-      * ASIC 算力较强，高难度可减少网络流量。
 
-  * **NerdMiner (ESP32)**:
+* **NerdMiner (ESP32)**:
+* **必须设置**: **1** (或 0.5)。
+* 说明: ESP32 算力极低（~50KH/s），如果使用默认 1024 难度，可能数小时都无法提交一个 Share，导致连接超时断开。
 
-      * **必须修改** `diff_asic`: 设置为 **1**。
-      * 原因：ESP32 算力极低（\~50KH/s），如果使用默认 1024 难度，可能几天都算不出一个 Share，导致连接超时断开。
 
-## 运行
 
-确保你的 Bitcoin Core 节点已完全同步，并且 `bitcoin.conf` 中开启了 server 模式和 zmq：
+## 🖥️ Web 监控面板
+
+启动网关后，您可以通过浏览器访问监控面板：
+
+**地址**: `http://<服务器IP>:8080`
+
+**功能**:
+
+* **Active Workers**: 查看在线矿机，包含 IP、**User-Agent (型号)**、实时算力、当前难度。
+* **Network Info**: 查看当前区块高度、全网难度、出块奖励。
+* **Recent Shares**: 实时滚动的 Share 提交记录（包含是否发现区块）。
+* **Top 3 Best Shares**: 本次运行周期内提交的最佳难度记录。
+
+## 🔗 前置要求 (Bitcoin Core)
+
+确保您的 Bitcoin Core 节点 (`bitcoin.conf`) 已配置如下：
 
 ```ini
-# bitcoin.conf
 server=1
-rpcuser=...
-rpcpassword=...
-zmqpubhashblock=tcp://127.0.0.1:28332
+txindex=1               # 推荐开启，便于查询
+rpcuser=your_user
+rpcpassword=your_pass
+zmqpubhashblock=tcp://0.0.0.0:28332  # 必须开启 ZMQ 以便网关快速响应
+rpcallowip=127.0.0.1/0  # 允许网关连接 IP
+
 ```
 
-启动网关：
+## 📝 开发计划 (Roadmap)
 
-```bash
-./satoshi_gateway -c config.json
-```
+* [x] 修复 Whatsminer Coinbase 长度兼容性问题。
+* [x] 修复 Web 面板 JSON 序列化崩溃问题。
+* [x] Web 面板增加 User-Agent 显示。
+* [ ] 实现“空块速发”机制 (Empty Block Fast Send)。
+* [ ] 增加更多品牌 ASIC 的自动识别与优化。
 
-## 架构说明
-
-  * **线程模型**：采用 Thread-per-Client 模型。每个连接的矿机都会分配一个独立的系统线程。这对于家庭网络（几十台设备）完全没有问题，且代码逻辑简单易读，方便二次开发。
-  * **空块策略**：当前版本在新区块发现时，会立即触发模板更新，但需等待 RPC 返回完整交易列表。相比工业级矿池（Empty Block Fast Send）可能有 1-2 秒的算力空转，但这对于 Solo 挖矿的影响微乎其微。
-
-## 开发计划 (Roadmap)
-
-  - [ ] 实现“空块速发”机制，进一步降低新块传播延迟。
-  - [ ] 增加针对不同 UserAgent 的自动难度匹配（无需手动改配置）。
-  - [ ] 增加 Web 监控面板。
-
-## 许可证
+## 📄 许可证
 
 本项目采用 MIT 许可证。详见 [LICENSE](https://www.google.com/search?q=LICENSE) 文件。
-
------
-
-**免责声明**：Solo 挖矿是一项靠运气的活动。使用 Satoshi Gateway 并不保证你能挖到区块。请确保你理解比特币挖矿的基本原理及风险。

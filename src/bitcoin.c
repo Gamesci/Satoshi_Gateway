@@ -54,7 +54,6 @@ static void nbits_to_target_be(uint32_t nbits, uint8_t target_be[32]) {
     target_be[idx + 2] = mant & 0xff;
 }
 
-// 将 nbits 转换为 diff (近似值，用于显示)
 static double nbits_to_diff(uint32_t nbits) {
     int shift = (nbits >> 24) & 0xff;
     double diff = (double)0x0000ffff / (double)(nbits & 0x00ffffff);
@@ -80,20 +79,12 @@ static void div256_u64_be(uint8_t x[32], uint64_t div) {
 
 static bool diff_to_target_be(double diff, uint8_t target_be[32]) {
     if (diff <= 0.0 || !isfinite(diff)) return false;
-    
-    // 初始化 Diff1 Target (0x00000000FFFF0000...)
     uint8_t diff1[32];
     diff1_target_be(diff1);
-
     if (diff < 1.0) diff = 1.0;
-
-    // 将 diff 转换为整数进行除法
     uint64_t diff_int = (uint64_t)diff;
     if (diff_int == 0) diff_int = 1;
-
-    // Target = Diff1 / Diff
     div256_u64_be(diff1, diff_int);
-    
     memcpy(target_be, diff1, 32);
     return true;
 }
@@ -187,26 +178,11 @@ static json_t* rpc_call(const char *method, json_t *params) {
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
 
     json_t *response = NULL;
-
     if (res == CURLE_OK && chunk.memory) {
         json_error_t err;
         response = json_loads(chunk.memory, 0, &err);
-        
         if (!response) {
-            if (http_code == 200) {
-                log_error("RPC JSON parse error: %.200s", chunk.memory);
-            } else {
-                log_error("RPC failed (HTTP %ld) and non-JSON body: %.200s", http_code, chunk.memory);
-            }
-        } else {
-            json_t *errf = json_object_get(response, "error");
-            if (errf && !json_is_null(errf)) {
-                char *es = json_dumps(errf, JSON_COMPACT);
-                log_error("RPC returned error for %s (HTTP %ld): %s", method, http_code, es ? es : "(unknown)");
-                free(es);
-            } else if (http_code != 200) {
-                log_error("RPC HTTP %ld for %s but no JSON error field", http_code, method);
-            }
+            log_error("RPC parse error or non-JSON response from %s", method);
         }
     } else {
         log_error("RPC %s connection failed: %s", method, curl_easy_strerror(res));
@@ -266,6 +242,8 @@ static bool template_deep_copy_notify(Template *dst, const Template *src) {
         }
     }
     dst->tx_count = src->tx_count;
+    // Note: tx_hexs and txids_le are NOT copied for notify purposes as they are large 
+    // and only needed for verification/submit, not for stratum broadcast.
     return true;
 }
 
@@ -282,7 +260,6 @@ bool bitcoin_get_latest_job(Template *out) {
 }
 
 // ---------- coinbase building ----------
-// Helper to write pushdata for generic usage
 static size_t write_pushdata(uint8_t *dst, size_t cap, const uint8_t *data, size_t len) {
     if (len <= 75) {
         if (cap < 1 + len) return 0;
@@ -305,19 +282,20 @@ static size_t write_pushdata(uint8_t *dst, size_t cap, const uint8_t *data, size
     return 0;
 }
 
-static bool build_coinbase_hex(uint32_t height, int64_t value_sats,
-                               const char *tag,
-                               bool is_segwit,
-                               const char *default_witness_commitment_hex,
-                               int extranonce1_size,
-                               int extranonce2_size,
-                               char *coinb1_hex, size_t coinb1_cap,
-                               char *coinb2_hex, size_t coinb2_cap) {
+// [FIX] 构建支持多变体的 Coinbase
+// variant: 0=Default, 1=Whatsminer, 2=Nicehash
+static bool build_coinbase_variant(uint32_t height, int64_t value_sats,
+                                   int variant,
+                                   bool is_segwit,
+                                   const char *default_witness_commitment_hex,
+                                   int extranonce1_size,
+                                   int extranonce2_size,
+                                   char *coinb1_hex, size_t coinb1_cap,
+                                   char *coinb2_hex, size_t coinb2_cap) {
     if (extranonce1_size <= 0 || extranonce2_size <= 0) return false;
-    if (extranonce1_size + extranonce2_size > 64) return false;
-
+    
     // --- ScriptSig Construction ---
-    uint8_t scriptSig[1024];
+    uint8_t scriptSig[4096];
     size_t sp = 0;
 
     // 1. BIP34 Height
@@ -333,8 +311,6 @@ static bool build_coinbase_hex(uint32_t height, int64_t value_sats,
 
     // 2. ExtraNonce Opcode & Placeholders
     size_t en_tot = (size_t)(extranonce1_size + extranonce2_size);
-    
-    // Explicitly write the Push Opcode for the ExtraNonce size
     if (sizeof(scriptSig) < sp + 3 + en_tot) return false;
 
     if (en_tot <= 75) {
@@ -348,25 +324,31 @@ static bool build_coinbase_hex(uint32_t height, int64_t value_sats,
         sp += 2;
     }
 
-    // --- SPLIT POINT 1 (coinb1 ends here) ---
     size_t split_point_1 = sp; 
-
-    // Write placeholder zeros for ExtraNonce (skipped in coinb2)
     memset(scriptSig + sp, 0, en_tot);
     sp += en_tot;
-
-    // --- SPLIT POINT 2 (coinb2 starts here) ---
     size_t split_point_2 = sp;
 
-    // 3. Pool Tag (Optional)
+    // 3. Variant Specific Padding / Tags
+    // [FIX] Whatsminer 兼容性处理：填充 Coinbase 以增加体积
+    if (variant == CB_VARIANT_WHATSMINER) {
+        const char *wm_pad = "SatoshiGateway/WhatsminerCompatMode/PaddingData...";
+        // 简单重复填充几次以确保大小适中
+        for(int k=0; k<2; k++) {
+            size_t w = write_pushdata(scriptSig + sp, sizeof(scriptSig) - sp, (uint8_t*)wm_pad, strlen(wm_pad));
+            if (w) sp += w;
+        }
+    } 
+    
+    // Tag
+    const char *tag = g_config.coinbase_tag;
     if (tag && tag[0]) {
         uint8_t tagbuf[64];
         size_t taglen = strlen(tag);
         if (taglen > 60) taglen = 60;
         memcpy(tagbuf, tag, taglen);
         size_t w3 = write_pushdata(scriptSig + sp, sizeof(scriptSig) - sp, tagbuf, taglen);
-        if (w3 == 0) return false;
-        sp += w3;
+        if (w3 > 0) sp += w3;
     }
 
     // --- Coinb1 ---
@@ -378,7 +360,7 @@ static bool build_coinbase_hex(uint32_t height, int64_t value_sats,
     put_le32(tx_prefix + tp, 0xffffffffU); tp += 4; // index
     tp += encode_varint(tx_prefix + tp, (uint64_t)sp); // Total ScriptSig Len
 
-    uint8_t coinb1_bin[2048];
+    uint8_t coinb1_bin[4096];
     if (sizeof(coinb1_bin) < tp + split_point_1) return false;
 
     size_t c1 = 0;
@@ -388,10 +370,8 @@ static bool build_coinbase_hex(uint32_t height, int64_t value_sats,
     // --- Coinb2 ---
     uint8_t coinb2_bin[4096];
     size_t c2 = 0;
-    // Start copying AFTER the ExtraNonce placeholders
     memcpy(coinb2_bin + c2, scriptSig + split_point_2, sp - split_point_2); 
     c2 += (sp - split_point_2);
-    
     put_le32(coinb2_bin + c2, 0xffffffffU); c2 += 4; // sequence
 
     // Outputs
@@ -406,20 +386,18 @@ static bool build_coinbase_hex(uint32_t height, int64_t value_sats,
     char script_hex[256];
     if (!address_to_script_checked(g_config.payout_addr, script_hex, sizeof(script_hex))) return false;
     size_t script_len = strlen(script_hex) / 2;
-    if (script_len > 252) return false;
     coinb2_bin[c2++] = (uint8_t)script_len;
     uint8_t script_bin[256];
-    if (!hex2bin_checked(script_hex, script_bin, script_len)) return false;
+    hex2bin_checked(script_hex, script_bin, script_len);
     memcpy(coinb2_bin + c2, script_bin, script_len); c2 += script_len;
 
     // Output 2: Witness Commitment
     if (has_wit_commit) {
         put_le64(coinb2_bin + c2, 0); c2 += 8; // value 0
         size_t wlen = strlen(default_witness_commitment_hex) / 2;
-        if (wlen > 120) return false;
         coinb2_bin[c2++] = (uint8_t)wlen;
         uint8_t wbin[128];
-        if (!hex2bin_checked(default_witness_commitment_hex, wbin, wlen)) return false;
+        hex2bin_checked(default_witness_commitment_hex, wbin, wlen);
         memcpy(coinb2_bin + c2, wbin, wlen); c2 += wlen;
     }
 
@@ -430,52 +408,63 @@ static bool build_coinbase_hex(uint32_t height, int64_t value_sats,
     return true;
 }
 
-static bool calculate_merkle_branch_from_txids(const uint8_t (*txids_le)[32], size_t tx_count,
-                                               char ***out_branch, size_t *out_count) {
+// [FIX] 正确的 Merkle Branch 生成逻辑
+// 1. 每一层取 index 0 的 sibling (即 index 1)
+// 2. [关键] 输出的 hex 必须是 Big Endian (Strutum 协议要求)，而内部计算用 Little Endian
+static bool calculate_merkle_branch_correct(const uint8_t (*txids_le)[32], size_t tx_count,
+                                            char ***out_branch, size_t *out_count) {
     *out_branch = NULL; *out_count = 0;
-    size_t total = 1 + tx_count;
-    if (total == 1) return true;
+    
+    // Coinbase at index 0, so we always need the sibling path for index 0
+    size_t level_len = 1 + tx_count; // placeholder for coinbase + txs
+    if (level_len == 1) return true; // Only coinbase, no branch
 
-    uint8_t *level = calloc(total, 32);
-    if (!level) return false;
-    for (size_t i = 0; i < tx_count; i++) memcpy(level + (i + 1) * 32, txids_le[i], 32);
+    uint8_t *current_level = calloc(level_len, 32);
+    if (!current_level) return false;
+
+    // Fill level 0. Start at index 1 because index 0 (coinbase) is implicit/varying
+    for (size_t i = 0; i < tx_count; i++) {
+        memcpy(current_level + (i + 1) * 32, txids_le[i], 32);
+    }
 
     char **branch = calloc(64, sizeof(char*));
-    if (!branch) { free(level); return false; }
-    size_t bcount = 0;
-    size_t level_count = total;
-    uint8_t *next = NULL;
+    size_t b_idx = 0;
 
-    while (level_count > 1) {
-        const uint8_t *sib = (level_count > 1) ? (level + 1 * 32) : (level + 0);
+    while (level_len > 1) {
+        // Since we are tracking the path for Index 0, the sibling is always at Index 1
+        const uint8_t *sibling_le = (level_len > 1) ? (current_level + 32) : current_level;
+        
+        // [CRITICAL FIX] Stratum requires byte-swapped (BE) hex string
+        uint8_t sibling_be[32];
+        memcpy(sibling_be, sibling_le, 32);
+        reverse_bytes(sibling_be, 32); // Convert LE to BE for Stratum Hex
+        
         char hex[65];
-        if (!bin2hex_safe(sib, 32, hex, sizeof(hex))) { free(level); free(branch); return false; }
-        branch[bcount] = strdup(hex);
-        if (!branch[bcount]) { free(level); for(size_t k=0;k<bcount;k++) free(branch[k]); free(branch); return false; }
-        bcount++;
+        bin2hex_safe(sibling_be, 32, hex, sizeof(hex));
+        branch[b_idx++] = strdup(hex);
 
-        size_t pairs = (level_count + 1) / 2;
-        next = calloc(pairs, 32);
-        if (!next) { free(level); for(size_t k=0;k<bcount;k++) free(branch[k]); free(branch); return false; }
-
-        for (size_t i = 0; i < pairs; i++) {
-            const uint8_t *L = level + (2 * i) * 32;
-            const uint8_t *R = (2 * i + 1 < level_count) ? (level + (2 * i + 1) * 32) : L;
-            uint8_t buf[64];
-            memcpy(buf, L, 32); memcpy(buf + 32, R, 32);
-            sha256d(buf, 64, next + i * 32);
+        // Calc next level
+        size_t next_len = (level_len + 1) / 2;
+        uint8_t *next_level = calloc(next_len, 32);
+        
+        for (size_t i = 0; i < next_len; i++) {
+            const uint8_t *left = current_level + (2 * i) * 32;
+            const uint8_t *right = ((2 * i + 1) < level_len) ? (current_level + (2 * i + 1) * 32) : left;
+            
+            uint8_t cat[64];
+            memcpy(cat, left, 32);
+            memcpy(cat + 32, right, 32);
+            sha256d(cat, 64, next_level + i * 32);
         }
-        free(level); level = next; next = NULL;
-        level_count = pairs;
-        if (bcount >= 64) break;
+        
+        free(current_level);
+        current_level = next_level;
+        level_len = next_len;
     }
-    free(level);
-    char **final = calloc(bcount, sizeof(char*));
-    if (!final && bcount > 0) { for(size_t k=0;k<bcount;k++) free(branch[k]); free(branch); return false; }
-    for (size_t i = 0; i < bcount; i++) final[i] = branch[i];
-    free(branch);
-    *out_branch = final;
-    *out_count = bcount;
+    
+    free(current_level);
+    *out_branch = branch;
+    *out_count = b_idx;
     return true;
 }
 
@@ -501,9 +490,7 @@ int bitcoin_validate_and_submit(const char *job_id,
                                 double diff,
                                 double *share_diff) {
     if (share_diff) *share_diff = 0.0;
-
     if (!job_id || !full_extranonce_hex || !ntime_hex) return 0;
-    if (!is_hex_len(ntime_hex, 8)) return 0;
 
     pthread_mutex_lock(&g_tmpl_lock);
     Template *job = NULL;
@@ -512,146 +499,161 @@ int bitcoin_validate_and_submit(const char *job_id,
     }
     if (!job) { pthread_mutex_unlock(&g_tmpl_lock); return 0; }
 
-    // Reconstruct Coinbase
-    size_t coin_hex_len = strlen(job->coinb1) + strlen(full_extranonce_hex) + strlen(job->coinb2);
-    if (coin_hex_len >= 32000) { pthread_mutex_unlock(&g_tmpl_lock); return 0; }
-    
-    char *coin_hex = malloc(coin_hex_len + 1);
-    strcpy(coin_hex, job->coinb1); strcat(coin_hex, full_extranonce_hex); strcat(coin_hex, job->coinb2);
-    
-    size_t coin_bin_len = strlen(coin_hex) / 2;
-    uint8_t *coin_bin = malloc(coin_bin_len);
-    hex2bin_checked(coin_hex, coin_bin, coin_bin_len);
-
-    uint8_t coinbase_txid[32];
-    sha256d(coin_bin, coin_bin_len, coinbase_txid);
-
+    // [FIX] Try all coinbase variants to validate the share
+    int valid_variant = -1;
     uint8_t root_le[32];
-    memcpy(root_le, coinbase_txid, 32);
+    uint8_t *coin_bin = NULL;
+    size_t coin_bin_len = 0;
+    char *coin_hex = NULL;
 
-    for (size_t i = 0; i < job->merkle_count; i++) {
-        uint8_t sib_le[32];
-        hex2bin_checked(job->merkle_branch[i], sib_le, 32);
-        uint8_t cat[64];
-        memcpy(cat, root_le, 32); memcpy(cat + 32, sib_le, 32);
-        sha256d(cat, 64, root_le);
+    for (int v = 0; v < MAX_COINBASE_VARIANTS; v++) {
+        size_t hlen = strlen(job->coinb1[v]) + strlen(full_extranonce_hex) + strlen(job->coinb2[v]);
+        if (hlen >= 32000) continue;
+        
+        char *tmp_hex = malloc(hlen + 1);
+        strcpy(tmp_hex, job->coinb1[v]); 
+        strcat(tmp_hex, full_extranonce_hex); 
+        strcat(tmp_hex, job->coinb2[v]);
+        
+        size_t bin_len = hlen / 2;
+        uint8_t *tmp_bin = malloc(bin_len);
+        hex2bin_checked(tmp_hex, tmp_bin, bin_len);
+        
+        uint8_t cb_txid[32];
+        sha256d(tmp_bin, bin_len, cb_txid);
+        
+        // Calculate Merkle Root
+        uint8_t curr_root[32];
+        memcpy(curr_root, cb_txid, 32);
+        
+        for (size_t k = 0; k < job->merkle_count; k++) {
+            uint8_t sib_be[32];
+            hex2bin_checked(job->merkle_branch[k], sib_be, 32);
+            
+            uint8_t sib_le[32];
+            memcpy(sib_le, sib_be, 32);
+            reverse_bytes(sib_le, 32); // [CRITICAL] BE Hex -> LE Bytes for internal calc
+            
+            uint8_t cat[64];
+            memcpy(cat, curr_root, 32);
+            memcpy(cat + 32, sib_le, 32);
+            sha256d(cat, 64, curr_root);
+        }
+        
+        // Construct header to verify PoW
+        uint8_t head[80];
+        uint32_t ver = job->version_val;
+        if (g_config.version_mask != 0) ver = (ver & ~g_config.version_mask) | (version_bits & g_config.version_mask);
+        put_le32(head + 0, ver);
+        memcpy(head + 4, job->prevhash_le, 32);
+        memcpy(head + 36, curr_root, 32);
+        uint32_t ntime = (uint32_t)strtoul(ntime_hex, NULL, 16);
+        put_le32(head + 68, ntime);
+        put_le32(head + 72, job->nbits_val);
+        put_le32(head + 76, nonce);
+
+        uint8_t hash_le[32]; sha256d(head, 80, hash_le);
+        uint8_t hash_be[32]; for(int i=0;i<32;i++) hash_be[i] = hash_le[31-i];
+        
+        // Calculate diff
+        double d = 0.0;
+        for (int i = 0; i < 32; i++) d = d * 256.0 + hash_be[i];
+        if (d < 1.0) d = 1.0;
+        double t1 = 65535.0 * pow(2.0, 208.0);
+        double s_diff = t1 / d;
+
+        uint8_t share_target_be[32];
+        diff_to_target_be(diff, share_target_be);
+        
+        if (cmp256_be(hash_be, share_target_be) <= 0) {
+            valid_variant = v;
+            memcpy(root_le, curr_root, 32);
+            if (share_diff) *share_diff = s_diff;
+            
+            // Save successful coin data for block submission
+            coin_hex = tmp_hex; // take ownership
+            coin_bin = tmp_bin; // take ownership
+            coin_bin_len = bin_len;
+            break; 
+        } else {
+            free(tmp_hex);
+            free(tmp_bin);
+        }
     }
 
+    if (valid_variant == -1) {
+        pthread_mutex_unlock(&g_tmpl_lock);
+        return 0; // Rejected
+    }
+
+    // Check if block
+    uint8_t block_target_be[32];
+    nbits_to_target_be(job->nbits_val, block_target_be);
+    
+    // We need to re-calc hash for block check (or reuse from loop if we optimized)
+    // Quick re-calc header
     uint8_t head[80];
     uint32_t ver = job->version_val;
     if (g_config.version_mask != 0) ver = (ver & ~g_config.version_mask) | (version_bits & g_config.version_mask);
     put_le32(head + 0, ver);
     memcpy(head + 4, job->prevhash_le, 32);
     memcpy(head + 36, root_le, 32);
-    uint32_t ntime = (uint32_t)strtoul(ntime_hex, NULL, 16);
-    put_le32(head + 68, ntime);
+    put_le32(head + 68, (uint32_t)strtoul(ntime_hex, NULL, 16));
     put_le32(head + 72, job->nbits_val);
     put_le32(head + 76, nonce);
-
     uint8_t hash_le[32]; sha256d(head, 80, hash_le);
     uint8_t hash_be[32]; for(int i=0;i<32;i++) hash_be[i] = hash_le[31-i];
-    
-    // --- Calculate Actual Share Difficulty ---
-    if (share_diff) {
-        double d = 0.0;
-        for (int i = 0; i < 32; i++) {
-            d = d * 256.0 + hash_be[i];
-        }
-        if (d < 1.0) d = 1.0;
-        
-        double t1 = 65535.0 * pow(2.0, 208.0);
-        *share_diff = t1 / d;
-    }
 
-    uint8_t share_target_be[32];
-    if (!diff_to_target_be(diff, share_target_be)) { free(coin_bin); free(coin_hex); pthread_mutex_unlock(&g_tmpl_lock); return 0; }
-    int accepted = (cmp256_be(hash_be, share_target_be) <= 0);
-
-    uint8_t block_target_be[32];
-    nbits_to_target_be(job->nbits_val, block_target_be);
     int is_block = (cmp256_be(hash_be, block_target_be) <= 0);
+    int result = 1; // Accepted share
 
-    int result = 0;
-    if (!accepted && !is_block) { result = 0; }
-    else if (is_block) {
-        char hash_hex[65]; bin2hex_safe(hash_be, 32, hash_hex, sizeof(hash_hex));
-        log_info(">>> BLOCK FOUND! Hash: %s", hash_hex);
-
+    if (is_block) {
+        log_info(">>> BLOCK FOUND! Hash via Variant %d", valid_variant);
+        // Build block hex
         size_t cap = 10 * 1024 * 1024;
         char *block_hex = malloc(cap);
-        if (!block_hex) { 
-            free(coin_bin); free(coin_hex); 
-            pthread_mutex_unlock(&g_tmpl_lock); 
-            log_error("Failed to allocate memory for block submission");
-            return 0; 
-        }
+        if (block_hex) {
+            size_t pos = 0;
+            char head_hex[161]; bin2hex_safe(head, 80, head_hex, sizeof(head_hex));
+            memcpy(block_hex + pos, head_hex, 160); pos += 160;
 
-        size_t pos = 0;
-        char head_hex[161]; bin2hex_safe(head, 80, head_hex, sizeof(head_hex));
-        memcpy(block_hex + pos, head_hex, 160); pos += 160;
+            uint8_t vi[9];
+            int vl = encode_varint(vi, (uint64_t)(1 + job->tx_count));
+            char vi_hex[19]; bin2hex_safe(vi, vl, vi_hex, sizeof(vi_hex));
+            memcpy(block_hex + pos, vi_hex, strlen(vi_hex)); pos += strlen(vi_hex);
 
-        uint8_t vi[9];
-        int vl = encode_varint(vi, (uint64_t)(1 + job->tx_count));
-        char vi_hex[19]; 
-        if (bin2hex_safe(vi, vl, vi_hex, sizeof(vi_hex))) {
-            memcpy(block_hex + pos, vi_hex, strlen(vi_hex)); 
-            pos += strlen(vi_hex);
-        } else {
-             memcpy(block_hex + pos, "01", 2); pos += 2;
-        }
+            if (job->has_segwit) {
+                 char part[128];
+                 bin2hex_safe(coin_bin, 4, part, sizeof(part));
+                 memcpy(block_hex + pos, part, 8); pos += 8;
+                 memcpy(block_hex + pos, "0001", 4); pos += 4;
+                 
+                 size_t body_len = coin_bin_len - 8;
+                 char *body_hex = malloc(body_len * 2 + 1);
+                 bin2hex_safe(coin_bin + 4, body_len, body_hex, body_len * 2 + 1);
+                 memcpy(block_hex + pos, body_hex, strlen(body_hex)); pos += strlen(body_hex);
+                 free(body_hex);
 
-        if (job->has_segwit) {
-            if (coin_bin_len < 8) {
-                free(block_hex); free(coin_bin); free(coin_hex);
-                pthread_mutex_unlock(&g_tmpl_lock);
-                return 0;
+                 memcpy(block_hex + pos, "01200000000000000000000000000000000000000000000000000000000000000000", 68); pos += 68;
+                 bin2hex_safe(coin_bin + coin_bin_len - 4, 4, part, sizeof(part));
+                 memcpy(block_hex + pos, part, 8); pos += 8;
+            } else {
+                 memcpy(block_hex + pos, coin_hex, strlen(coin_hex)); pos += strlen(coin_hex);
             }
-            char part[128];
-            bin2hex_safe(coin_bin, 4, part, sizeof(part));
-            memcpy(block_hex + pos, part, 8); pos += 8;
-            memcpy(block_hex + pos, "0001", 4); pos += 4;
-            
-            size_t body_len = coin_bin_len - 8; 
-            char *body_hex = malloc(body_len * 2 + 1);
-            if (!body_hex) {
-                 free(block_hex); free(coin_bin); free(coin_hex);
-                 pthread_mutex_unlock(&g_tmpl_lock);
-                 return 0;
+
+            for (size_t i = 0; i < job->tx_count; i++) {
+                size_t tl = strlen(job->tx_hexs[i]);
+                if (pos + tl + 1 < cap) { memcpy(block_hex + pos, job->tx_hexs[i], tl); pos += tl; }
             }
-            bin2hex_safe(coin_bin + 4, body_len, body_hex, body_len * 2 + 1);
-            memcpy(block_hex + pos, body_hex, strlen(body_hex)); pos += strlen(body_hex);
-            free(body_hex);
-            
-            memcpy(block_hex + pos, "01200000000000000000000000000000000000000000000000000000000000000000", 68);
-            pos += 68;
-            
-            bin2hex_safe(coin_bin + coin_bin_len - 4, 4, part, sizeof(part));
-            memcpy(block_hex + pos, part, 8); pos += 8;
-            
-        } else {
-            memcpy(block_hex + pos, coin_hex, strlen(coin_hex)); pos += strlen(coin_hex);
+            block_hex[pos] = '\0';
+            backup_block_to_disk(block_hex);
+            if (bitcoin_submit_block(block_hex)) result = 2;
+            free(block_hex);
         }
-
-        for (size_t i = 0; i < job->tx_count; i++) {
-            size_t tl = strlen(job->tx_hexs[i]);
-            if (pos + tl + 1 >= cap) break;
-            memcpy(block_hex + pos, job->tx_hexs[i], tl); pos += tl;
-        }
-        block_hex[pos] = '\0';
-        backup_block_to_disk(block_hex);
-
-        if (bitcoin_submit_block(block_hex)) {
-            log_info("Block submitted successfully");
-            result = 2;
-        } else {
-            result = 1;
-        }
-        free(block_hex);
-    } else {
-        result = 1; // Share accepted
     }
 
-    free(coin_bin); free(coin_hex);
+    if (coin_hex) free(coin_hex);
+    if (coin_bin) free(coin_bin);
     pthread_mutex_unlock(&g_tmpl_lock);
     return result;
 }
@@ -673,11 +675,9 @@ void bitcoin_update_template(bool force_clean) {
     const char *prev = json_string_value(json_object_get(res, "previousblockhash"));
     if (!prev || strlen(prev) != 64) { json_decref(resp); return; }
 
-    // RPC returns Big Endian PrevHash. Convert to Little Endian (Internal).
     uint8_t prev_be[32]; hex2bin_checked(prev, prev_be, 32);
     uint8_t prev_le[32]; memcpy(prev_le, prev_be, 32); reverse_bytes(prev_le, 32);
 
-    bool clean = force_clean;
     Template tmp;
     template_zero(&tmp);
     tmp.valid = true;
@@ -717,7 +717,6 @@ void bitcoin_update_template(bool force_clean) {
             const char *txid = json_string_value(json_object_get(tx, "txid"));
             const char *data = json_string_value(json_object_get(tx, "data"));
             
-            // RPC TxID is Big Endian. Convert to LE (Internal).
             uint8_t bin[32];
             hex2bin_checked(txid, bin, 32);
             memcpy(tmp.txids_le[i], bin, 32); reverse_bytes(tmp.txids_le[i], 32);
@@ -728,18 +727,23 @@ void bitcoin_update_template(bool force_clean) {
     const char *dwc = NULL;
     json_t *dw = json_object_get(res, "default_witness_commitment");
     if (dw && json_is_string(dw)) dwc = json_string_value(dw);
-
     tmp.has_segwit = (dwc != NULL);
 
-    if (!build_coinbase_hex(tmp.height, tmp.coinbase_value, g_config.coinbase_tag,
-                            tmp.has_segwit, dwc,
-                            4, g_config.extranonce2_size,
-                            tmp.coinb1, sizeof(tmp.coinb1),
-                            tmp.coinb2, sizeof(tmp.coinb2))) {
-        bitcoin_free_job(&tmp); json_decref(resp); return;
+    // [FIX] 生成所有版本的 Coinbase
+    for (int v = 0; v < MAX_COINBASE_VARIANTS; v++) {
+        if (!build_coinbase_variant(tmp.height, tmp.coinbase_value, 
+                                    v, // variant index
+                                    tmp.has_segwit, dwc,
+                                    4, g_config.extranonce2_size,
+                                    tmp.coinb1[v], sizeof(tmp.coinb1[v]),
+                                    tmp.coinb2[v], sizeof(tmp.coinb2[v]))) {
+            log_error("Failed to build coinbase variant %d", v);
+            bitcoin_free_job(&tmp); json_decref(resp); return;
+        }
     }
 
-    if (!calculate_merkle_branch_from_txids((const uint8_t (*)[32])tmp.txids_le, tmp.tx_count,
+    // [FIX] 使用新的 Merkle 算法
+    if (!calculate_merkle_branch_correct((const uint8_t (*)[32])tmp.txids_le, tmp.tx_count,
                                            &tmp.merkle_branch, &tmp.merkle_count)) {
         bitcoin_free_job(&tmp); json_decref(resp); return;
     }
@@ -747,36 +751,30 @@ void bitcoin_update_template(bool force_clean) {
     pthread_mutex_lock(&g_tmpl_lock);
     Template *last = &g_jobs[g_job_head];
     
-    // [FIX 2] 作业去重逻辑
     bool is_different = false;
+    bool clean = force_clean;
     if (last->valid) {
         if (strncmp(last->prev_hash_stratum, tmp.prev_hash_stratum, 64) != 0) {
-            // New block (prevhash changed)
-            clean = true;
-            is_different = true;
+            clean = true; is_different = true;
         } else {
-            // Same block, check params
             if (last->curtime_val != tmp.curtime_val ||
                 last->version_val != tmp.version_val ||
                 last->nbits_val != tmp.nbits_val ||
                 last->tx_count != tmp.tx_count) {
                 is_different = true;
             } else {
-                // Check merkle branches if tx count is same
                 for(size_t k=0; k<tmp.merkle_count; k++) {
                     if (strcmp(last->merkle_branch[k], tmp.merkle_branch[k]) != 0) {
-                        is_different = true; 
-                        break;
+                        is_different = true; break;
                     }
                 }
             }
         }
     } else {
-        is_different = true; // First job
+        is_different = true;
     }
 
     if (!is_different) {
-        // Template identical, skip update
         pthread_mutex_unlock(&g_tmpl_lock);
         bitcoin_free_job(&tmp);
         json_decref(resp);
@@ -795,17 +793,14 @@ void bitcoin_update_template(bool force_clean) {
     template_deep_copy_notify(&notify_snapshot, curr);
     pthread_mutex_unlock(&g_tmpl_lock);
 
-    log_info("Job %s [H:%u Tx:%zu] Clean:%d (SegWit:%d)",
-             notify_snapshot.job_id, notify_snapshot.height,
-             notify_snapshot.tx_count, notify_snapshot.clean_jobs ? 1 : 0, notify_snapshot.has_segwit);
+    log_info("Job %s [H:%u Tx:%zu] Clean:%d", notify_snapshot.job_id, notify_snapshot.height,
+             notify_snapshot.tx_count, notify_snapshot.clean_jobs ? 1 : 0);
 
     stratum_broadcast_job(&notify_snapshot);
     bitcoin_free_job(&notify_snapshot);
-
     json_decref(resp);
 }
 
-// 导出遥测数据 (Block Height, Reward, Network Difficulty)
 void bitcoin_get_telemetry(uint32_t *height, int64_t *reward, uint32_t *difficulty) {
     pthread_mutex_lock(&g_tmpl_lock);
     const Template *curr = &g_jobs[g_job_head];

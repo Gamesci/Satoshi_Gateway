@@ -320,14 +320,12 @@ static bool build_coinbase_variant(uint32_t height, int64_t value_sats,
     size_t split_point_2 = sp;
 
     // 3. Variant Specific Padding / Tags
-    // [FIX] Whatsminer 兼容性处理
+    // [FIXED] Removed the excessive padding loop.
+    // Replaced with a single short marker to ensure scriptSig length is well below 100 bytes.
     if (variant == CB_VARIANT_WHATSMINER) {
-        const char *wm_pad = "SatoshiGateway/WhatsminerCompatMode/PaddingData...";
-        // 增加 Padding，避免 Whatsminer 认为 Coinbase 太短
-        for(int k=0; k<20; k++) {
-            size_t w = write_pushdata(scriptSig + sp, sizeof(scriptSig) - sp, (uint8_t*)wm_pad, strlen(wm_pad));
-            if (w) sp += w;
-        }
+        const char *wm_pad = "/WM/";
+        size_t w = write_pushdata(scriptSig + sp, sizeof(scriptSig) - sp, (uint8_t*)wm_pad, strlen(wm_pad));
+        if (w) sp += w;
     } 
     
     // Tag

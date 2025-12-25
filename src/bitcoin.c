@@ -54,6 +54,7 @@ static void nbits_to_target_be(uint32_t nbits, uint8_t target_be[32]) {
     target_be[idx + 2] = mant & 0xff;
 }
 
+// [FIX] Ensure return is double and calculation handles large diffs
 static double nbits_to_diff(uint32_t nbits) {
     int shift = (nbits >> 24) & 0xff;
     double diff = (double)0x0000ffff / (double)(nbits & 0x00ffffff);
@@ -83,19 +84,11 @@ static bool diff_to_target_be(double diff, uint8_t target_be[32]) {
     diff1_target_be(diff1);
     if (diff < 1.0) diff = 1.0;
     uint64_t diff_int = (uint64_t)diff;
+    // Handle huge diffs (Testnet4/Regtest might have very low diff, causing high target)
+    // But here we are converting SHARE diff to target.
     if (diff_int == 0) diff_int = 1;
     div256_u64_be(diff1, diff_int);
     memcpy(target_be, diff1, 32);
-    return true;
-}
-
-static bool is_hex_len(const char *s, size_t expect_len) {
-    if (!s) return false;
-    if (strlen(s) != expect_len) return false;
-    for (size_t i = 0; i < expect_len; i++) {
-        char c = s[i];
-        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) return false;
-    }
     return true;
 }
 
@@ -242,8 +235,6 @@ static bool template_deep_copy_notify(Template *dst, const Template *src) {
         }
     }
     dst->tx_count = src->tx_count;
-    // Note: tx_hexs and txids_le are NOT copied for notify purposes as they are large 
-    // and only needed for verification/submit, not for stratum broadcast.
     return true;
 }
 
@@ -282,7 +273,6 @@ static size_t write_pushdata(uint8_t *dst, size_t cap, const uint8_t *data, size
     return 0;
 }
 
-// [FIX] 构建支持多变体的 Coinbase
 static bool build_coinbase_variant(uint32_t height, int64_t value_sats,
                                    int variant,
                                    bool is_segwit,
@@ -329,10 +319,11 @@ static bool build_coinbase_variant(uint32_t height, int64_t value_sats,
     size_t split_point_2 = sp;
 
     // 3. Variant Specific Padding / Tags
-    // [FIX] Whatsminer 兼容性处理：填充 Coinbase
+    // [FIX] Whatsminer 兼容性处理
     if (variant == CB_VARIANT_WHATSMINER) {
         const char *wm_pad = "SatoshiGateway/WhatsminerCompatMode/PaddingData...";
-        for(int k=0; k<2; k++) {
+        // 增加 Padding，避免 Whatsminer 认为 Coinbase 太短
+        for(int k=0; k<20; k++) {
             size_t w = write_pushdata(scriptSig + sp, sizeof(scriptSig) - sp, (uint8_t*)wm_pad, strlen(wm_pad));
             if (w) sp += w;
         }
@@ -406,9 +397,7 @@ static bool build_coinbase_variant(uint32_t height, int64_t value_sats,
     return true;
 }
 
-// [FIX] 正确的 Merkle Branch 生成逻辑，但恢复为 LE (Little Endian)
-// 1. 每一层取 index 0 的 sibling (即 index 1)
-// 2. [REVERT] 保持 Little Endian Hex，因为 Bitaxe 等矿机通常按 LE 解析
+// [FIX] Correct Merkle Branch (idx^1) and use LE Hex (Bitaxe/Stratum Standard)
 static bool calculate_merkle_branch_correct(const uint8_t (*txids_le)[32], size_t tx_count,
                                             char ***out_branch, size_t *out_count) {
     *out_branch = NULL; *out_count = 0;
@@ -431,7 +420,7 @@ static bool calculate_merkle_branch_correct(const uint8_t (*txids_le)[32], size_
         // Since we are tracking the path for Index 0, the sibling is always at Index 1
         const uint8_t *sibling_le = (level_len > 1) ? (current_level + 32) : current_level;
         
-        // [REVERT] 直接使用 LE Hex，不要翻转为 BE
+        // [FIXED] Use LE Hex directly. Do NOT reverse to BE.
         char hex[65];
         bin2hex_safe(sibling_le, 32, hex, sizeof(hex));
         branch[b_idx++] = strdup(hex);
@@ -492,7 +481,6 @@ int bitcoin_validate_and_submit(const char *job_id,
     }
     if (!job) { pthread_mutex_unlock(&g_tmpl_lock); return 0; }
 
-    // [FIX] Try all coinbase variants
     int valid_variant = -1;
     uint8_t root_le[32];
     uint8_t *coin_bin = NULL;
@@ -521,7 +509,7 @@ int bitcoin_validate_and_submit(const char *job_id,
         
         for (size_t k = 0; k < job->merkle_count; k++) {
             uint8_t sib_le[32];
-            // [REVERT] 直接从 Hex (LE) 转 bin (LE)，无需 reverse
+            // [FIXED] Direct LE Hex -> LE Bin
             hex2bin_checked(job->merkle_branch[k], sib_le, 32);
             
             uint8_t cat[64];
@@ -716,7 +704,6 @@ void bitcoin_update_template(bool force_clean) {
     if (dw && json_is_string(dw)) dwc = json_string_value(dw);
     tmp.has_segwit = (dwc != NULL);
 
-    // [FIX] 生成所有版本的 Coinbase
     for (int v = 0; v < MAX_COINBASE_VARIANTS; v++) {
         if (!build_coinbase_variant(tmp.height, tmp.coinbase_value, 
                                     v, // variant index
@@ -729,7 +716,6 @@ void bitcoin_update_template(bool force_clean) {
         }
     }
 
-    // [FIX] 使用新的 Merkle 算法
     if (!calculate_merkle_branch_correct((const uint8_t (*)[32])tmp.txids_le, tmp.tx_count,
                                            &tmp.merkle_branch, &tmp.merkle_count)) {
         bitcoin_free_job(&tmp); json_decref(resp); return;
@@ -788,13 +774,14 @@ void bitcoin_update_template(bool force_clean) {
     json_decref(resp);
 }
 
-void bitcoin_get_telemetry(uint32_t *height, int64_t *reward, uint32_t *difficulty) {
+// [FIX] Use double for difficulty to prevent INT32_MIN overflow
+void bitcoin_get_telemetry(uint32_t *height, int64_t *reward, double *difficulty) {
     pthread_mutex_lock(&g_tmpl_lock);
     const Template *curr = &g_jobs[g_job_head];
     if (curr->valid) {
         if (height) *height = curr->height;
         if (reward) *reward = curr->coinbase_value;
-        if (difficulty) *difficulty = (uint32_t)nbits_to_diff(curr->nbits_val);
+        if (difficulty) *difficulty = nbits_to_diff(curr->nbits_val);
     } else {
         if (height) *height = 0;
         if (reward) *reward = 0;

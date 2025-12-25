@@ -111,7 +111,8 @@ static Client* client_add(int sock, struct sockaddr_in addr) {
         log_error("Failed to set SO_SNDTIMEO on client socket");
     }
 
-    tv.tv_sec = 600; 
+    // [OPTIMIZATION] 改为 30秒 超时，允许我们在矿机不出 Share 时唤醒并检查 VarDiff
+    tv.tv_sec = 30; 
     tv.tv_usec = 0;
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
 
@@ -403,7 +404,7 @@ json_t* stratum_get_stats(void) {
     }
     json_object_set_new(blk, "best_shares", top_shares_json);
     
-    // [FIXED HERE] 补上 block_info，防止 Web 界面崩溃
+    // [FIXED] 补上 block_info，防止 Web 界面崩溃
     json_object_set_new(root, "block_info", blk);
 
     json_t *logs = json_array();
@@ -440,8 +441,54 @@ static void *client_worker(void *arg) {
     log_info("Worker connected: ID=%d IP=%s", c->id, inet_ntoa(c->addr.sin_addr));
 
     while (c->active) {
+        // [OPTIMIZATION] recv 会在 30秒 后返回，即使没有数据
         ssize_t n = recv(c->sock, buf + rpos, sizeof(buf) - 1 - rpos, 0);
-        if (n <= 0) break;
+        
+        // --- 优化开始: 处理超时与死锁检测 ---
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // 如果是超时 (30秒无数据)，检查是否需要紧急降难度
+                time_t now = time(NULL);
+                double dt = difftime(now, c->last_retarget_time);
+
+                // 判定: 90秒内没调整过，且一个 Share 都没提交 (Share饿死)
+                if (dt > 90.0 && c->shares_in_window == 0 && c->current_diff > g_config.vardiff_min_diff) {
+                    
+                    // 紧急措施：难度直接砍半
+                    double new_diff = c->current_diff / 2.0;
+                    if (new_diff < g_config.vardiff_min_diff) new_diff = g_config.vardiff_min_diff;
+
+                    log_info("VarDiff Starvation ID=%d: No shares for %.0fs. Emergency drop %.0f -> %.0f", 
+                             c->id, dt, c->current_diff, new_diff);
+
+                    c->current_diff = new_diff;
+                    c->last_retarget_time = now;
+                    // shares_in_window 保持为 0
+
+                    // 1. 下发新难度
+                    send_difficulty(c, new_diff);
+                    
+                    // 2. 立即强制下发新任务 (Notify, CleanJobs=true)，让矿机立刻用新难度计算
+                    Template t;
+                    if (bitcoin_get_latest_job(&t)) {
+                        t.clean_jobs = true; 
+                        stratum_send_mining_notify(c->sock, &t);
+                        bitcoin_free_job(&t);
+                    }
+                }
+                
+                // 继续监听，不要断开
+                continue; 
+            }
+            // 真正的 socket 错误
+            break;
+        }
+        else if (n == 0) {
+            // 客户端主动断开
+            break;
+        }
+        // --- 优化结束 ---
+
         rpos += (int)n;
         buf[rpos] = 0;
 
@@ -603,6 +650,7 @@ static void *client_worker(void *arg) {
 
                             record_share(c->extranonce1_hex, actual_share_diff, "Valid Share", (ret == 2));
 
+                            // VarDiff Normal Adjustment (Based on valid shares)
                             double dt = difftime(now, c->last_retarget_time);
                             if (dt >= 60.0) {
                                 double spm = (c->shares_in_window / dt) * 60.0;

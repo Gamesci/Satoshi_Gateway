@@ -14,10 +14,11 @@ typedef struct {
     int stratum_port;
     int poll_interval_sec;
 
-    int initial_diff;
-    int vardiff_target;
-    int vardiff_min_diff;
-    int vardiff_max_diff;
+    // [FIX] Changed to double to prevent integer overflow (2^31 limit)
+    double initial_diff;
+    int vardiff_target; // This is shares/minute, int is fine
+    double vardiff_min_diff;
+    double vardiff_max_diff;
 
     int extranonce2_size;
     uint32_t version_mask;

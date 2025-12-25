@@ -40,8 +40,11 @@ typedef struct {
     time_t last_submit_time;
     uint64_t total_shares;
     
-    // New: 记录该 worker 连接期间的最佳 Share 难度
     double best_diff; 
+    
+    // [FIX] 新增：客户端标识
+    char user_agent[128];
+    int coinbase_variant; // 对应 bitcoin.h 中的 CB_VARIANT_*
 } Client;
 
 void stratum_send_mining_notify(int sock, Template *tmpl);

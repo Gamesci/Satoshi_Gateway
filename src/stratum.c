@@ -134,7 +134,6 @@ static Client* client_add(int sock, struct sockaddr_in addr) {
             c->total_shares = 0;
             c->best_diff = 0.0;
             
-            // Default Variant
             c->coinbase_variant = CB_VARIANT_DEFAULT;
             c->user_agent[0] = '\0';
 
@@ -265,7 +264,6 @@ static Client* client_find_by_sock(int sock) {
     return out;
 }
 
-// [FIX] 识别矿机指纹
 static int detect_coinbase_variant(const char *ua) {
     if (!ua) return CB_VARIANT_DEFAULT;
     char ua_lower[128];
@@ -277,7 +275,6 @@ static int detect_coinbase_variant(const char *ua) {
     return CB_VARIANT_DEFAULT;
 }
 
-// [FIX] 根据 Client 的变体选择正确的 coinb1/coinb2
 void stratum_send_mining_notify(int sock, Template *tmpl) {
     if (!tmpl) return;
 
@@ -292,7 +289,6 @@ void stratum_send_mining_notify(int sock, Template *tmpl) {
     json_t *p = json_array();
     json_array_append_new(p, json_string(tmpl->job_id));
     json_array_append_new(p, json_string(tmpl->prev_hash_stratum));
-    // 使用 Variant 对应的 Coinbase
     json_array_append_new(p, json_string(tmpl->coinb1[v]));
     json_array_append_new(p, json_string(tmpl->coinb2[v]));
 
@@ -356,7 +352,7 @@ json_t* stratum_get_stats(void) {
             json_object_set_new(w, "id", json_integer(g_clients[i].id));
             json_object_set_new(w, "ex1", json_string(g_clients[i].extranonce1_hex));
             json_object_set_new(w, "ip", json_string(inet_ntoa(g_clients[i].addr.sin_addr)));
-            json_object_set_new(w, "ua", json_string(g_clients[i].user_agent)); // Show UA
+            json_object_set_new(w, "ua", json_string(g_clients[i].user_agent));
             json_object_set_new(w, "hashrate", json_real(g_clients[i].hashrate_est));
             json_object_set_new(w, "diff", json_real(g_clients[i].current_diff));
             json_object_set_new(w, "shares", json_integer(g_clients[i].total_shares));
@@ -387,13 +383,14 @@ json_t* stratum_get_stats(void) {
 
     uint32_t height = 0;
     int64_t reward = 0;
-    uint32_t net_diff = 0;
+    // [FIX] Use double for difficulty
+    double net_diff = 0.0;
     bitcoin_get_telemetry(&height, &reward, &net_diff);
     
     json_t *blk = json_object();
     json_object_set_new(blk, "height", json_integer(height));
     json_object_set_new(blk, "reward", json_integer(reward));
-    json_object_set_new(blk, "net_diff", json_real((double)net_diff));
+    json_object_set_new(blk, "net_diff", json_real(net_diff));
     
     json_t *top_shares_json = json_array();
     for (int k = 0; k < 3; k++) {
@@ -405,8 +402,6 @@ json_t* stratum_get_stats(void) {
         }
     }
     json_object_set_new(blk, "best_shares", top_shares_json);
-
-    json_object_set_new(root, "block_info", blk);
 
     json_t *logs = json_array();
     pthread_mutex_lock(&g_stats_lock);
@@ -466,7 +461,6 @@ static void *client_worker(void *arg) {
                         send_json(c->sock, res);
                     }
                     else if (strcmp(m, "mining.subscribe") == 0) {
-                        // [FIX] Detect User-Agent from subscribe params
                         json_t *params = json_object_get(req, "params");
                         if (params && json_is_array(params) && json_array_size(params) > 0) {
                             const char *ua = json_string_value(json_array_get(params, 0));

@@ -729,7 +729,7 @@ void bitcoin_update_template(bool force_clean) {
     }
 
     // Build Coinbase
-    build_coinbase_hex(tmp.height, tmp.coinbase_value, g_config.pool_tag, 
+    build_coinbase_hex(tmp.height, tmp.coinbase_value, g_config.coinbase_tag, 
                        tmp.has_segwit, tmp.default_witness_commitment,
                        4, g_config.extranonce2_size, // 4 bytes EN1 + Config EN2
                        tmp.coinb1, sizeof(tmp.coinb1),

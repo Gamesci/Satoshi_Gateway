@@ -70,17 +70,27 @@ int load_config(const char *filename) {
     }
     if (g_config.stratum_port <= 0) g_config.stratum_port = 3333;
 
+    // [FIX] Load diff as double to handle large values
     json_t *diff = json_object_get(root, "diff_asic");
-    g_config.initial_diff = (diff && json_is_integer(diff)) ? (int)json_integer_value(diff) : 1024;
-    if (g_config.initial_diff < 1) g_config.initial_diff = 1;
+    if (diff) {
+        if (json_is_integer(diff)) g_config.initial_diff = (double)json_integer_value(diff);
+        else if (json_is_real(diff)) g_config.initial_diff = json_real_value(diff);
+        else g_config.initial_diff = 1024.0;
+    } else {
+        g_config.initial_diff = 1024.0;
+    }
+    if (g_config.initial_diff < 1.0) g_config.initial_diff = 1.0;
 
     json_t *vd_target = json_object_get(root, "vardiff_target_shares_min");
     g_config.vardiff_target = (vd_target && json_is_integer(vd_target)) ? (int)json_integer_value(vd_target) : 20;
     if (g_config.vardiff_target < 1) g_config.vardiff_target = 1;
 
-    g_config.vardiff_min_diff = g_config.initial_diff / 4;
-    if (g_config.vardiff_min_diff < 1) g_config.vardiff_min_diff = 1;
-    g_config.vardiff_max_diff = g_config.initial_diff * 4096;
+    // [FIX] Calculate bounds using double arithmetic
+    g_config.vardiff_min_diff = g_config.initial_diff / 4.0;
+    if (g_config.vardiff_min_diff < 1.0) g_config.vardiff_min_diff = 1.0;
+    
+    // This calculation previously overflowed int32 when initial_diff > 524288
+    g_config.vardiff_max_diff = g_config.initial_diff * 4096.0;
 
     json_t *poll = json_object_get(root, "poll_interval");
     if (poll) {

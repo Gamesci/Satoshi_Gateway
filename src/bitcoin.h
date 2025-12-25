@@ -54,13 +54,13 @@ void bitcoin_update_template(bool force_clean);
 bool bitcoin_get_latest_job(Template *out);
 void bitcoin_free_job(Template *t);
 
-// 修改：增加 has_version_bits 参数，用于安全判断 ASICBoost
+// [Fix] 增加 has_version_bits 参数用于精确控制 ASICBoost 逻辑
 int bitcoin_validate_and_submit(const char *job_id,
                                 const char *full_extranonce_hex,
                                 const char *ntime_hex,
                                 uint32_t nonce,
                                 uint32_t version_bits,
-                                bool has_version_bits, // <--- 新增
+                                bool has_version_bits,
                                 double diff,
                                 double *share_diff);
 

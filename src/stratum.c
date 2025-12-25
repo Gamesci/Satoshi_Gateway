@@ -129,11 +129,14 @@ static Client* client_add(int sock, struct sockaddr_in addr) {
             c->last_retarget_time = time(NULL);
             c->shares_in_window = 0;
             
-            // Stats Init
             c->hashrate_est = 0.0;
             c->last_submit_time = time(NULL);
             c->total_shares = 0;
             c->best_diff = 0.0;
+            
+            // Default Variant
+            c->coinbase_variant = CB_VARIANT_DEFAULT;
+            c->user_agent[0] = '\0';
 
             snprintf(c->extranonce1_hex, sizeof(c->extranonce1_hex), "%08x", (uint32_t)c->id);
             c->last_job_id[0] = '\0';
@@ -262,19 +265,36 @@ static Client* client_find_by_sock(int sock) {
     return out;
 }
 
+// [FIX] 识别矿机指纹
+static int detect_coinbase_variant(const char *ua) {
+    if (!ua) return CB_VARIANT_DEFAULT;
+    char ua_lower[128];
+    strncpy(ua_lower, ua, 127); ua_lower[127] = 0;
+    for(int i=0; ua_lower[i]; i++) ua_lower[i] = tolower(ua_lower[i]);
+
+    if (strstr(ua_lower, "whatsminer")) return CB_VARIANT_WHATSMINER;
+    if (strstr(ua_lower, "nicehash")) return CB_VARIANT_NICEHASH;
+    return CB_VARIANT_DEFAULT;
+}
+
+// [FIX] 根据 Client 的变体选择正确的 coinb1/coinb2
 void stratum_send_mining_notify(int sock, Template *tmpl) {
     if (!tmpl) return;
 
     Client *c = client_find_by_sock(sock);
-    if (c) {
-        snprintf(c->last_job_id, sizeof(c->last_job_id), "%s", tmpl->job_id);
-    }
+    if (!c) return;
+
+    snprintf(c->last_job_id, sizeof(c->last_job_id), "%s", tmpl->job_id);
+
+    int v = c->coinbase_variant;
+    if (v < 0 || v >= MAX_COINBASE_VARIANTS) v = 0;
 
     json_t *p = json_array();
     json_array_append_new(p, json_string(tmpl->job_id));
     json_array_append_new(p, json_string(tmpl->prev_hash_stratum));
-    json_array_append_new(p, json_string(tmpl->coinb1));
-    json_array_append_new(p, json_string(tmpl->coinb2));
+    // 使用 Variant 对应的 Coinbase
+    json_array_append_new(p, json_string(tmpl->coinb1[v]));
+    json_array_append_new(p, json_string(tmpl->coinb2[v]));
 
     json_t *m = json_array();
     for (size_t i = 0; i < tmpl->merkle_count; i++) {
@@ -319,13 +339,11 @@ json_t* stratum_get_stats(void) {
     json_t *workers = json_array();
     double total_hashrate = 0;
 
-    // 定义用于排序的简单结构
     struct BestShare {
         double diff;
         char worker[16];
     } top3[3];
     
-    // 初始化
     for(int k=0; k<3; k++) { 
         top3[k].diff = 0.0; 
         memset(top3[k].worker, 0, sizeof(top3[k].worker)); 
@@ -338,6 +356,7 @@ json_t* stratum_get_stats(void) {
             json_object_set_new(w, "id", json_integer(g_clients[i].id));
             json_object_set_new(w, "ex1", json_string(g_clients[i].extranonce1_hex));
             json_object_set_new(w, "ip", json_string(inet_ntoa(g_clients[i].addr.sin_addr)));
+            json_object_set_new(w, "ua", json_string(g_clients[i].user_agent)); // Show UA
             json_object_set_new(w, "hashrate", json_real(g_clients[i].hashrate_est));
             json_object_set_new(w, "diff", json_real(g_clients[i].current_diff));
             json_object_set_new(w, "shares", json_integer(g_clients[i].total_shares));
@@ -345,17 +364,12 @@ json_t* stratum_get_stats(void) {
             json_array_append_new(workers, w);
             total_hashrate += g_clients[i].hashrate_est;
 
-            // 维护 Top 3 Best Diff 逻辑
             if (g_clients[i].best_diff > 0) {
                 double d = g_clients[i].best_diff;
                 char *n = g_clients[i].extranonce1_hex;
-                
                 for (int k = 0; k < 3; k++) {
                     if (d > top3[k].diff) {
-                        // 插入位置 k，将后面的元素后移
-                        for (int m = 2; m > k; m--) {
-                            top3[m] = top3[m-1];
-                        }
+                        for (int m = 2; m > k; m--) { top3[m] = top3[m-1]; }
                         top3[k].diff = d;
                         strncpy(top3[k].worker, n, 15);
                         top3[k].worker[15] = '\0';
@@ -381,7 +395,6 @@ json_t* stratum_get_stats(void) {
     json_object_set_new(blk, "reward", json_integer(reward));
     json_object_set_new(blk, "net_diff", json_real((double)net_diff));
     
-    // 构建 Top 3 数组并放入 JSON
     json_t *top_shares_json = json_array();
     for (int k = 0; k < 3; k++) {
         if (top3[k].diff > 0) {
@@ -453,6 +466,17 @@ static void *client_worker(void *arg) {
                         send_json(c->sock, res);
                     }
                     else if (strcmp(m, "mining.subscribe") == 0) {
+                        // [FIX] Detect User-Agent from subscribe params
+                        json_t *params = json_object_get(req, "params");
+                        if (params && json_is_array(params) && json_array_size(params) > 0) {
+                            const char *ua = json_string_value(json_array_get(params, 0));
+                            if (ua) {
+                                strncpy(c->user_agent, ua, sizeof(c->user_agent)-1);
+                                c->coinbase_variant = detect_coinbase_variant(c->user_agent);
+                                log_info("Client %d UA: %s (Variant: %d)", c->id, c->user_agent, c->coinbase_variant);
+                            }
+                        }
+
                         json_object_set_new(res, "error", json_null());
                         json_t *arr = json_array();
                         json_t *subs = json_array();
@@ -469,7 +493,6 @@ static void *client_worker(void *arg) {
                         json_array_append_new(arr, json_integer(g_config.extranonce2_size));
                         json_object_set_new(res, "result", arr);
                         send_json(c->sock, res);
-                        log_info("ID=%d subscribed", c->id);
                     }
                     else if (strcmp(m, "mining.authorize") == 0) {
                         c->is_authorized = true;
@@ -480,7 +503,7 @@ static void *client_worker(void *arg) {
                         send_difficulty(c, c->current_diff);
                         Template t;
                         if (bitcoin_get_latest_job(&t)) {
-                            t.clean_jobs = true; // [FIX 1] Force clean=true on first auth
+                            t.clean_jobs = true; 
                             stratum_send_mining_notify(c->sock, &t);
                             bitcoin_free_job(&t);
                         }
@@ -538,7 +561,7 @@ static void *client_worker(void *arg) {
 
                         const char *jid_used = jid;
                         int ret = 0;
-                        double actual_share_diff = 0.0; // [FIX 2] Variable for stats
+                        double actual_share_diff = 0.0;
 
                         if (ok_dec) ret = bitcoin_validate_and_submit(jid, full_extranonce, nt, nonce_dec, version_bits, c->current_diff, &actual_share_diff);
                         if (ret == 0 && ok_hex) ret = bitcoin_validate_and_submit(jid, full_extranonce, nt, nonce_hex, version_bits, c->current_diff, &actual_share_diff);
@@ -570,7 +593,6 @@ static void *client_worker(void *arg) {
                             time_t now = time(NULL);
                             c->last_submit_time = now;
                             
-                            // Update Personal Best
                             if (actual_share_diff > c->best_diff) {
                                 c->best_diff = actual_share_diff;
                             }
@@ -582,7 +604,6 @@ static void *client_worker(void *arg) {
                             if (c->hashrate_est == 0) c->hashrate_est = instant_hr;
                             else c->hashrate_est = c->hashrate_est * 0.95 + instant_hr * 0.05;
 
-                            // Record share with actual diff
                             record_share(c->extranonce1_hex, actual_share_diff, "Valid Share", (ret == 2));
 
                             double dt = difftime(now, c->last_retarget_time);
@@ -604,7 +625,7 @@ static void *client_worker(void *arg) {
                                     send_difficulty(c, new_diff);
                                     Template t;
                                     if (bitcoin_get_latest_job(&t)) {
-                                        t.clean_jobs = true; // Still force clean on Diff change
+                                        t.clean_jobs = true; 
                                         stratum_send_mining_notify(c->sock, &t);
                                         bitcoin_free_job(&t);
                                     }

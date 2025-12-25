@@ -402,6 +402,9 @@ json_t* stratum_get_stats(void) {
         }
     }
     json_object_set_new(blk, "best_shares", top_shares_json);
+    
+    // [FIXED HERE] 补上 block_info，防止 Web 界面崩溃
+    json_object_set_new(root, "block_info", blk);
 
     json_t *logs = json_array();
     pthread_mutex_lock(&g_stats_lock);

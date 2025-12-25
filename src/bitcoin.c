@@ -499,8 +499,7 @@ int bitcoin_validate_and_submit(const char *job_id,
                                 uint32_t nonce,
                                 uint32_t version_bits,
                                 double diff,
-                                double *share_diff) { // 新增参数
-    // 初始化返回参数
+                                double *share_diff) {
     if (share_diff) *share_diff = 0.0;
 
     if (!job_id || !full_extranonce_hex || !ntime_hex) return 0;
@@ -552,12 +551,9 @@ int bitcoin_validate_and_submit(const char *job_id,
     uint8_t hash_le[32]; sha256d(head, 80, hash_le);
     uint8_t hash_be[32]; for(int i=0;i<32;i++) hash_be[i] = hash_le[31-i];
     
-    // --- [NEW] Calculate Actual Share Difficulty ---
-    // Diff = Target1 / Hash
-    // Target1 (approx) = 65535 * 2^208
+    // --- Calculate Actual Share Difficulty ---
     if (share_diff) {
         double d = 0.0;
-        // Convert first 256 bits (or sufficient MSB) to double
         for (int i = 0; i < 32; i++) {
             d = d * 256.0 + hash_be[i];
         }
@@ -566,7 +562,6 @@ int bitcoin_validate_and_submit(const char *job_id,
         double t1 = 65535.0 * pow(2.0, 208.0);
         *share_diff = t1 / d;
     }
-    // -----------------------------------------------
 
     uint8_t share_target_be[32];
     if (!diff_to_target_be(diff, share_target_be)) { free(coin_bin); free(coin_hex); pthread_mutex_unlock(&g_tmpl_lock); return 0; }
@@ -614,7 +609,6 @@ int bitcoin_validate_and_submit(const char *job_id,
             char part[128];
             bin2hex_safe(coin_bin, 4, part, sizeof(part));
             memcpy(block_hex + pos, part, 8); pos += 8;
-            
             memcpy(block_hex + pos, "0001", 4); pos += 4;
             
             size_t body_len = coin_bin_len - 8; 
@@ -752,9 +746,43 @@ void bitcoin_update_template(bool force_clean) {
 
     pthread_mutex_lock(&g_tmpl_lock);
     Template *last = &g_jobs[g_job_head];
+    
+    // [FIX 2] 作业去重逻辑
+    bool is_different = false;
     if (last->valid) {
-        if (strncmp(last->prev_hash_stratum, tmp.prev_hash_stratum, 64) != 0) clean = true;
+        if (strncmp(last->prev_hash_stratum, tmp.prev_hash_stratum, 64) != 0) {
+            // New block (prevhash changed)
+            clean = true;
+            is_different = true;
+        } else {
+            // Same block, check params
+            if (last->curtime_val != tmp.curtime_val ||
+                last->version_val != tmp.version_val ||
+                last->nbits_val != tmp.nbits_val ||
+                last->tx_count != tmp.tx_count) {
+                is_different = true;
+            } else {
+                // Check merkle branches if tx count is same
+                for(size_t k=0; k<tmp.merkle_count; k++) {
+                    if (strcmp(last->merkle_branch[k], tmp.merkle_branch[k]) != 0) {
+                        is_different = true; 
+                        break;
+                    }
+                }
+            }
+        }
+    } else {
+        is_different = true; // First job
     }
+
+    if (!is_different) {
+        // Template identical, skip update
+        pthread_mutex_unlock(&g_tmpl_lock);
+        bitcoin_free_job(&tmp);
+        json_decref(resp);
+        return;
+    }
+
     tmp.clean_jobs = clean;
     g_job_head = (g_job_head + 1) % MAX_JOB_HISTORY;
     Template *curr = &g_jobs[g_job_head];

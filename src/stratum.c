@@ -457,14 +457,19 @@ static void *client_worker(void *arg) {
                         json_object_set_new(res, "error", json_null());
                         json_t *arr = json_array();
                         json_t *subs = json_array();
-                        json_t *s1 = json_array();
-                        json_array_append_new(s1, json_string("mining.set_difficulty"));
-                        json_array_append_new(s1, json_string("1"));
-                        json_array_append_new(subs, s1);
+
+                        // [Fix for Bitaxe] Cleaned up subscriptions
+                        // Only add 'mining.notify'. Removed 'mining.set_difficulty'
                         json_t *s2 = json_array();
                         json_array_append_new(s2, json_string("mining.notify"));
-                        json_array_append_new(s2, json_string("1"));
+                        
+                        // [Fix] Use hex string for Subscription ID (Session ID)
+                        char sub_id[16];
+                        snprintf(sub_id, sizeof(sub_id), "%x", c->id);
+                        json_array_append_new(s2, json_string(sub_id));
+                        
                         json_array_append_new(subs, s2);
+                        
                         json_array_append_new(arr, subs);
                         json_array_append_new(arr, json_string(c->extranonce1_hex));
                         json_array_append_new(arr, json_integer(g_config.extranonce2_size));
@@ -472,9 +477,22 @@ static void *client_worker(void *arg) {
                         send_json(c->sock, res);
                         log_info("ID=%d subscribed", c->id);
                         
-                        // [Compatibility Fix]
-                        // 如果开启了 Version Rolling 且是神马矿机(UserAgent包含Whatsminer)或为了最大兼容性，
-                        // 在 subscribe 成功后（此时矿机已经处于监听状态）发送 mask 通知。
+                        // [IMPORTANT] Do NOT send mining.set_version_mask here.
+                        // Wait for authorize.
+                    }
+                    else if (strcmp(m, "mining.authorize") == 0) {
+                        c->is_authorized = true;
+                        json_object_set_new(res, "error", json_null());
+                        json_object_set_new(res, "result", json_true());
+                        send_json(c->sock, res);
+                        log_info("ID=%d authorized", c->id);
+                        
+                        // 1. Send Difficulty first
+                        send_difficulty(c, c->current_diff);
+
+                        // 2. [Compatibility Fix] Send Mask NOW
+                        // This is the safest place. Bitaxe handshake is done.
+                        // Whatsminer will receive this before the first job and enable ASICBoost.
                         if (g_config.version_mask != 0) {
                             char ms[16];
                             snprintf(ms, sizeof(ms), "%08x", g_config.version_mask);
@@ -487,14 +505,8 @@ static void *client_worker(void *arg) {
                             send_json(c->sock, notif);
                             json_decref(notif);
                         }
-                    }
-                    else if (strcmp(m, "mining.authorize") == 0) {
-                        c->is_authorized = true;
-                        json_object_set_new(res, "error", json_null());
-                        json_object_set_new(res, "result", json_true());
-                        send_json(c->sock, res);
-                        log_info("ID=%d authorized", c->id);
-                        send_difficulty(c, c->current_diff);
+
+                        // 3. Send First Job
                         Template t;
                         if (bitcoin_get_latest_job(&t)) {
                             t.clean_jobs = true; 
@@ -511,9 +523,9 @@ static void *client_worker(void *arg) {
                         json_object_set_new(r, "version-rolling.mask", json_string(ms));
                         json_object_set_new(res, "result", r);
                         send_json(c->sock, res);
-
-                        // [Fix] Removed proactive set_version_mask here to avoid Bitaxe race condition.
-                        // The mask is already in the result above.
+                        
+                        // [IMPORTANT] NO NOTIFICATIONS HERE.
+                        // Bitaxe crashes if we send notifications before subscribe completes.
                     }
                     else if (strcmp(m, "mining.submit") == 0) {
                         json_t *p = json_object_get(req, "params");

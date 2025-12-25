@@ -51,7 +51,6 @@
                 v /= 1000;
                 unitIndex++;
             }
-            // 500=500, 1000=1K, 1500=1.5K
             return parseFloat(v.toFixed(2)) + (unitIndex > 0 ? units[unitIndex] : '');
         };
 
@@ -131,6 +130,12 @@
             const totalHashrate = data.workers.reduce((acc, w) => acc + w.hashrate, 0);
             const sortedShares = data.recent_shares ? [...data.recent_shares].sort((a, b) => b.time - a.time) : [];
 
+            // 辅助函数：根据 ex1 ID 查找 Worker UA
+            const findWorkerUA = (ex1) => {
+                const w = data.workers.find(w => w.ex1 === ex1);
+                return w ? w.ua : null;
+            };
+
             return (
                 <div className="min-h-screen p-4 lg:p-8 max-w-[1600px] mx-auto font-sans">
                     {/* Top Stats Cards */}
@@ -146,14 +151,17 @@
                             <div className="text-sm text-slate-400 font-bold uppercase tracking-wider">Active Workers</div>
                             <div className="text-3xl font-bold text-green-400 mt-1">{data.workers.length}</div>
                         </div>
+                        {/* 容错：防止 block_info 为空时页面崩溃 */}
                         <div className="card p-5">
                             <div className="text-sm text-slate-400 font-bold uppercase tracking-wider">Block Height</div>
-                            <div className="text-3xl font-bold text-yellow-400 mt-1">{data.block_info.height}</div>
+                            <div className="text-3xl font-bold text-yellow-400 mt-1">
+                                {data.block_info ? data.block_info.height : '-'}
+                            </div>
                         </div>
                         <div className="card p-5">
                             <div className="text-sm text-slate-400 font-bold uppercase tracking-wider">Reward</div>
                             <div className="text-3xl font-bold text-slate-200 mt-1">
-                                {(data.block_info.reward / 100000000).toFixed(4)} <span className="text-base text-slate-500">BTC</span>
+                                {data.block_info ? (data.block_info.reward / 100000000).toFixed(4) : '0.0000'} <span className="text-base text-slate-500">BTC</span>
                             </div>
                         </div>
                     </div>
@@ -171,7 +179,9 @@
                             <div className="space-y-4">
                                 <div className="flex justify-between border-b border-slate-800 pb-2">
                                     <span className="text-slate-400">Network Diff</span>
-                                    <span className="text-white font-mono">{formatDiff(data.block_info.net_diff)}</span>
+                                    <span className="text-white font-mono">
+                                        {data.block_info ? formatDiff(data.block_info.net_diff) : '0'}
+                                    </span>
                                 </div>
                                 <div className="flex justify-between border-b border-slate-800 pb-2">
                                     <span className="text-slate-400">Pool Algo</span>
@@ -185,7 +195,7 @@
                                         <span className="text-[10px] opacity-70">SESSION</span>
                                     </div>
                                     
-                                    {data.block_info.best_shares && data.block_info.best_shares.length > 0 ? (
+                                    {data.block_info && data.block_info.best_shares && data.block_info.best_shares.length > 0 ? (
                                         <div className="space-y-2">
                                             {data.block_info.best_shares.map((share, idx) => (
                                                 <div key={idx} className="flex justify-between items-center text-sm border-b border-blue-800/30 last:border-0 pb-1 last:pb-0">
@@ -193,7 +203,11 @@
                                                         <span className={`font-mono text-xs w-4 h-4 flex items-center justify-center rounded ${idx===0 ? 'bg-yellow-500/20 text-yellow-400' : 'bg-slate-700/50 text-slate-400'}`}>
                                                             {idx + 1}
                                                         </span>
-                                                        <span className="text-slate-300 font-mono text-xs">{share.worker}</span>
+                                                        <div className="flex flex-col leading-tight">
+                                                            <span className="text-slate-300 font-mono text-xs truncate w-24" title={findWorkerUA(share.worker) || share.worker}>
+                                                                {findWorkerUA(share.worker) || share.worker}
+                                                            </span>
+                                                        </div>
                                                     </div>
                                                     <span className="text-white font-mono font-bold">
                                                         {formatDiff(share.diff)}
@@ -230,7 +244,8 @@
                                     <thead className="bg-slate-900/50">
                                         <tr>
                                             <th className="table-th">Status</th>
-                                            <th className="table-th">ID (ExtraNonce1)</th>
+                                            {/* 修改表头 */}
+                                            <th className="table-th">Miner</th>
                                             <th className="table-th text-right">Hashrate</th>
                                             <th className="table-th text-right">Difficulty</th>
                                             <th className="table-th text-right">Shares</th>
@@ -243,7 +258,11 @@
                                                 <td className="table-td">
                                                     <div className="w-2 h-2 rounded-full bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.6)] mx-auto lg:mx-0"></div>
                                                 </td>
-                                                <td className="table-td font-mono text-blue-400">{w.ex1}</td>
+                                                {/* 修改内容：显示 UA 和 ID */}
+                                                <td className="table-td">
+                                                    <div className="text-blue-400 font-bold text-xs">{w.ua}</div>
+                                                    <div className="text-slate-600 font-mono text-[10px] mt-0.5">ID: {w.ex1}</div>
+                                                </td>
                                                 <td className="table-td text-right text-white font-bold">{formatHashrate(w.hashrate)}</td>
                                                 <td className="table-td text-right font-mono">{formatDiff(w.diff)}</td>
                                                 <td className="table-td text-right">{w.shares}</td>
@@ -265,22 +284,29 @@
                                         </tr>
                                     </thead>
                                     <tbody>
-                                        {sortedShares.map((s, idx) => (
-                                            <tr key={idx} className={`hover:bg-slate-800/50 transition ${s.is_block ? 'bg-yellow-900/20' : ''}`}>
-                                                <td className="table-td text-slate-400">{formatTime(s.time)}</td>
-                                                <td className="table-td font-mono text-blue-400">{s.worker}</td>
-                                                <td className="table-td text-right font-mono text-white">
-                                                    {formatDiff(s.diff)}
-                                                </td>
-                                                <td className="table-td text-right">
-                                                    {s.is_block ? (
-                                                        <span className="text-yellow-400 font-bold px-2 py-0.5 rounded bg-yellow-400/10">BLOCK FOUND</span>
-                                                    ) : (
-                                                        <span className="text-green-500 text-xs">Valid</span>
-                                                    )}
-                                                </td>
-                                            </tr>
-                                        ))}
+                                        {sortedShares.map((s, idx) => {
+                                            // 自动查找 UA
+                                            const ua = findWorkerUA(s.worker);
+                                            return (
+                                                <tr key={idx} className={`hover:bg-slate-800/50 transition ${s.is_block ? 'bg-yellow-900/20' : ''}`}>
+                                                    <td className="table-td text-slate-400">{formatTime(s.time)}</td>
+                                                    <td className="table-td">
+                                                        <div className="text-blue-400 font-mono text-xs">{ua || s.worker}</div>
+                                                        {ua && <div className="text-slate-600 text-[10px] font-mono">{s.worker}</div>}
+                                                    </td>
+                                                    <td className="table-td text-right font-mono text-white">
+                                                        {formatDiff(s.diff)}
+                                                    </td>
+                                                    <td className="table-td text-right">
+                                                        {s.is_block ? (
+                                                            <span className="text-yellow-400 font-bold px-2 py-0.5 rounded bg-yellow-400/10">BLOCK FOUND</span>
+                                                        ) : (
+                                                            <span className="text-green-500 text-xs">Valid</span>
+                                                        )}
+                                                    </td>
+                                                </tr>
+                                            );
+                                        })}
                                     </tbody>
                                 </table>
                             )}

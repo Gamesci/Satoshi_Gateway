@@ -40,8 +40,7 @@ static time_t g_last_history_update = 0;
 static void record_share(const char *ex1, double diff, const char *hash, bool is_block) {
     pthread_mutex_lock(&g_stats_lock);
     int idx = g_share_log_head;
-    // Fix: use memcpy instead of strncpy to avoid truncation warning
-    memcpy(g_share_logs[idx].worker_ex1, ex1, 8);
+    strncpy(g_share_logs[idx].worker_ex1, ex1, 8);
     g_share_logs[idx].worker_ex1[8] = 0;
     g_share_logs[idx].difficulty = diff;
     strncpy(g_share_logs[idx].share_hash, hash, 64);
@@ -457,28 +456,20 @@ static void *client_worker(void *arg) {
                         json_object_set_new(res, "error", json_null());
                         json_t *arr = json_array();
                         json_t *subs = json_array();
-
-                        // [Fix for Bitaxe] Cleaned up subscriptions
-                        // Only add 'mining.notify'. Removed 'mining.set_difficulty'
+                        json_t *s1 = json_array();
+                        json_array_append_new(s1, json_string("mining.set_difficulty"));
+                        json_array_append_new(s1, json_string("1"));
+                        json_array_append_new(subs, s1);
                         json_t *s2 = json_array();
                         json_array_append_new(s2, json_string("mining.notify"));
-                        
-                        // [Fix] Use hex string for Subscription ID (Session ID)
-                        char sub_id[16];
-                        snprintf(sub_id, sizeof(sub_id), "%x", c->id);
-                        json_array_append_new(s2, json_string(sub_id));
-                        
+                        json_array_append_new(s2, json_string("1"));
                         json_array_append_new(subs, s2);
-                        
                         json_array_append_new(arr, subs);
                         json_array_append_new(arr, json_string(c->extranonce1_hex));
                         json_array_append_new(arr, json_integer(g_config.extranonce2_size));
                         json_object_set_new(res, "result", arr);
                         send_json(c->sock, res);
                         log_info("ID=%d subscribed", c->id);
-                        
-                        // [IMPORTANT] Do NOT send mining.set_version_mask here.
-                        // Wait for authorize.
                     }
                     else if (strcmp(m, "mining.authorize") == 0) {
                         c->is_authorized = true;
@@ -486,30 +477,10 @@ static void *client_worker(void *arg) {
                         json_object_set_new(res, "result", json_true());
                         send_json(c->sock, res);
                         log_info("ID=%d authorized", c->id);
-                        
-                        // 1. Send Difficulty first
                         send_difficulty(c, c->current_diff);
-
-                        // 2. [Compatibility Fix] Send Mask NOW
-                        // This is the safest place. Bitaxe handshake is done.
-                        // Whatsminer will receive this before the first job and enable ASICBoost.
-                        if (g_config.version_mask != 0) {
-                            char ms[16];
-                            snprintf(ms, sizeof(ms), "%08x", g_config.version_mask);
-                            json_t *notif = json_object();
-                            json_object_set_new(notif, "id", json_null());
-                            json_object_set_new(notif, "method", json_string("mining.set_version_mask"));
-                            json_t *nparams = json_array();
-                            json_array_append_new(nparams, json_string(ms));
-                            json_object_set_new(notif, "params", nparams);
-                            send_json(c->sock, notif);
-                            json_decref(notif);
-                        }
-
-                        // 3. Send First Job
                         Template t;
                         if (bitcoin_get_latest_job(&t)) {
-                            t.clean_jobs = true; 
+                            t.clean_jobs = true; // [FIX 1] Force clean=true on first auth
                             stratum_send_mining_notify(c->sock, &t);
                             bitcoin_free_job(&t);
                         }
@@ -523,9 +494,6 @@ static void *client_worker(void *arg) {
                         json_object_set_new(r, "version-rolling.mask", json_string(ms));
                         json_object_set_new(res, "result", r);
                         send_json(c->sock, res);
-                        
-                        // [IMPORTANT] NO NOTIFICATIONS HERE.
-                        // Bitaxe crashes if we send notifications before subscribe completes.
                     }
                     else if (strcmp(m, "mining.submit") == 0) {
                         json_t *p = json_object_get(req, "params");
@@ -541,21 +509,20 @@ static void *client_worker(void *arg) {
                         const char *nh  = json_string_value(json_array_get(p, 4));
                         const char *vh  = NULL;
                         if (json_array_size(p) >= 6) vh = json_string_value(json_array_get(p, 5));
-                        
-                        bool has_version_bits = (vh && strlen(vh) > 0);
+                        if (!vh) vh = "";
 
                         if (!jid || strlen(jid) == 0 ||
                             !en2 || !is_fixed_hex(en2, (size_t)g_config.extranonce2_size * 2) ||
                             !nt  || !is_fixed_hex(nt, 8) ||
                             !nh  || strlen(nh) == 0 ||
-                            (has_version_bits && !is_fixed_hex(vh, 8))) {
+                            (strlen(vh) > 0 && !is_fixed_hex(vh, 8))) {
                             json_reply_error(res, 20, "Invalid submit fields");
                             send_json(c->sock, res);
                             json_decref(res); json_decref(req); start = end + 1; continue;
                         }
 
                         uint32_t version_bits = 0;
-                        if (has_version_bits) version_bits = (uint32_t)strtoul(vh, NULL, 16);
+                        if (vh[0]) version_bits = (uint32_t)strtoul(vh, NULL, 16);
 
                         bool ok_dec = false, ok_hex = false;
                         uint32_t nonce_dec = 0, nonce_hex = 0;
@@ -571,15 +538,15 @@ static void *client_worker(void *arg) {
 
                         const char *jid_used = jid;
                         int ret = 0;
-                        double actual_share_diff = 0.0;
+                        double actual_share_diff = 0.0; // [FIX 2] Variable for stats
 
-                        if (ok_dec) ret = bitcoin_validate_and_submit(jid, full_extranonce, nt, nonce_dec, version_bits, has_version_bits, c->current_diff, &actual_share_diff);
-                        if (ret == 0 && ok_hex) ret = bitcoin_validate_and_submit(jid, full_extranonce, nt, nonce_hex, version_bits, has_version_bits, c->current_diff, &actual_share_diff);
+                        if (ok_dec) ret = bitcoin_validate_and_submit(jid, full_extranonce, nt, nonce_dec, version_bits, c->current_diff, &actual_share_diff);
+                        if (ret == 0 && ok_hex) ret = bitcoin_validate_and_submit(jid, full_extranonce, nt, nonce_hex, version_bits, c->current_diff, &actual_share_diff);
 
                         if (ret == 0 && c->last_job_id[0] && strcmp(c->last_job_id, jid) != 0) {
                             jid_used = c->last_job_id;
-                            if (ok_dec) ret = bitcoin_validate_and_submit(jid_used, full_extranonce, nt, nonce_dec, version_bits, has_version_bits, c->current_diff, &actual_share_diff);
-                            if (ret == 0 && ok_hex) ret = bitcoin_validate_and_submit(jid_used, full_extranonce, nt, nonce_hex, version_bits, has_version_bits, c->current_diff, &actual_share_diff);
+                            if (ok_dec) ret = bitcoin_validate_and_submit(jid_used, full_extranonce, nt, nonce_dec, version_bits, c->current_diff, &actual_share_diff);
+                            if (ret == 0 && ok_hex) ret = bitcoin_validate_and_submit(jid_used, full_extranonce, nt, nonce_hex, version_bits, c->current_diff, &actual_share_diff);
                         }
 
                         char keybuf[256];
@@ -597,11 +564,13 @@ static void *client_worker(void *arg) {
                             json_object_set_new(res, "result", json_true());
                             json_object_set_new(res, "error", json_null());
 
+                            // Stats Update
                             c->shares_in_window++;
                             c->total_shares++;
                             time_t now = time(NULL);
                             c->last_submit_time = now;
                             
+                            // Update Personal Best
                             if (actual_share_diff > c->best_diff) {
                                 c->best_diff = actual_share_diff;
                             }
@@ -613,6 +582,7 @@ static void *client_worker(void *arg) {
                             if (c->hashrate_est == 0) c->hashrate_est = instant_hr;
                             else c->hashrate_est = c->hashrate_est * 0.95 + instant_hr * 0.05;
 
+                            // Record share with actual diff
                             record_share(c->extranonce1_hex, actual_share_diff, "Valid Share", (ret == 2));
 
                             double dt = difftime(now, c->last_retarget_time);
@@ -634,7 +604,7 @@ static void *client_worker(void *arg) {
                                     send_difficulty(c, new_diff);
                                     Template t;
                                     if (bitcoin_get_latest_job(&t)) {
-                                        t.clean_jobs = true; 
+                                        t.clean_jobs = true; // Still force clean on Diff change
                                         stratum_send_mining_notify(c->sock, &t);
                                         bitcoin_free_job(&t);
                                     }

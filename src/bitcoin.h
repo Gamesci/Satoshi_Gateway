@@ -43,6 +43,9 @@ typedef struct {
 
     // For building block when found
     char **tx_hexs;
+    
+    // Witness commitment for block construction
+    char default_witness_commitment[128];
 } Template;
 
 int bitcoin_init(void);
@@ -51,14 +54,15 @@ void bitcoin_update_template(bool force_clean);
 bool bitcoin_get_latest_job(Template *out);
 void bitcoin_free_job(Template *t);
 
-// 修改：增加 share_diff 参数用于传出实际难度
+// 修改：增加 has_version_bits 参数，用于安全判断 ASICBoost
 int bitcoin_validate_and_submit(const char *job_id,
                                 const char *full_extranonce_hex,
                                 const char *ntime_hex,
                                 uint32_t nonce,
                                 uint32_t version_bits,
+                                bool has_version_bits, // <--- 新增
                                 double diff,
-                                double *share_diff); // <--- 新增参数
+                                double *share_diff);
 
 // 获取当前的区块元数据供 API 使用
 void bitcoin_get_telemetry(uint32_t *height, int64_t *reward, uint32_t *difficulty);

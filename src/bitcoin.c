@@ -283,7 +283,6 @@ static size_t write_pushdata(uint8_t *dst, size_t cap, const uint8_t *data, size
 }
 
 // [FIX] 构建支持多变体的 Coinbase
-// variant: 0=Default, 1=Whatsminer, 2=Nicehash
 static bool build_coinbase_variant(uint32_t height, int64_t value_sats,
                                    int variant,
                                    bool is_segwit,
@@ -330,10 +329,9 @@ static bool build_coinbase_variant(uint32_t height, int64_t value_sats,
     size_t split_point_2 = sp;
 
     // 3. Variant Specific Padding / Tags
-    // [FIX] Whatsminer 兼容性处理：填充 Coinbase 以增加体积
+    // [FIX] Whatsminer 兼容性处理：填充 Coinbase
     if (variant == CB_VARIANT_WHATSMINER) {
         const char *wm_pad = "SatoshiGateway/WhatsminerCompatMode/PaddingData...";
-        // 简单重复填充几次以确保大小适中
         for(int k=0; k<2; k++) {
             size_t w = write_pushdata(scriptSig + sp, sizeof(scriptSig) - sp, (uint8_t*)wm_pad, strlen(wm_pad));
             if (w) sp += w;
@@ -408,14 +406,13 @@ static bool build_coinbase_variant(uint32_t height, int64_t value_sats,
     return true;
 }
 
-// [FIX] 正确的 Merkle Branch 生成逻辑
+// [FIX] 正确的 Merkle Branch 生成逻辑，但恢复为 LE (Little Endian)
 // 1. 每一层取 index 0 的 sibling (即 index 1)
-// 2. [关键] 输出的 hex 必须是 Big Endian (Strutum 协议要求)，而内部计算用 Little Endian
+// 2. [REVERT] 保持 Little Endian Hex，因为 Bitaxe 等矿机通常按 LE 解析
 static bool calculate_merkle_branch_correct(const uint8_t (*txids_le)[32], size_t tx_count,
                                             char ***out_branch, size_t *out_count) {
     *out_branch = NULL; *out_count = 0;
     
-    // Coinbase at index 0, so we always need the sibling path for index 0
     size_t level_len = 1 + tx_count; // placeholder for coinbase + txs
     if (level_len == 1) return true; // Only coinbase, no branch
 
@@ -434,13 +431,9 @@ static bool calculate_merkle_branch_correct(const uint8_t (*txids_le)[32], size_
         // Since we are tracking the path for Index 0, the sibling is always at Index 1
         const uint8_t *sibling_le = (level_len > 1) ? (current_level + 32) : current_level;
         
-        // [CRITICAL FIX] Stratum requires byte-swapped (BE) hex string
-        uint8_t sibling_be[32];
-        memcpy(sibling_be, sibling_le, 32);
-        reverse_bytes(sibling_be, 32); // Convert LE to BE for Stratum Hex
-        
+        // [REVERT] 直接使用 LE Hex，不要翻转为 BE
         char hex[65];
-        bin2hex_safe(sibling_be, 32, hex, sizeof(hex));
+        bin2hex_safe(sibling_le, 32, hex, sizeof(hex));
         branch[b_idx++] = strdup(hex);
 
         // Calc next level
@@ -499,7 +492,7 @@ int bitcoin_validate_and_submit(const char *job_id,
     }
     if (!job) { pthread_mutex_unlock(&g_tmpl_lock); return 0; }
 
-    // [FIX] Try all coinbase variants to validate the share
+    // [FIX] Try all coinbase variants
     int valid_variant = -1;
     uint8_t root_le[32];
     uint8_t *coin_bin = NULL;
@@ -527,12 +520,9 @@ int bitcoin_validate_and_submit(const char *job_id,
         memcpy(curr_root, cb_txid, 32);
         
         for (size_t k = 0; k < job->merkle_count; k++) {
-            uint8_t sib_be[32];
-            hex2bin_checked(job->merkle_branch[k], sib_be, 32);
-            
             uint8_t sib_le[32];
-            memcpy(sib_le, sib_be, 32);
-            reverse_bytes(sib_le, 32); // [CRITICAL] BE Hex -> LE Bytes for internal calc
+            // [REVERT] 直接从 Hex (LE) 转 bin (LE)，无需 reverse
+            hex2bin_checked(job->merkle_branch[k], sib_le, 32);
             
             uint8_t cat[64];
             memcpy(cat, curr_root, 32);
@@ -540,7 +530,7 @@ int bitcoin_validate_and_submit(const char *job_id,
             sha256d(cat, 64, curr_root);
         }
         
-        // Construct header to verify PoW
+        // Construct header
         uint8_t head[80];
         uint32_t ver = job->version_val;
         if (g_config.version_mask != 0) ver = (ver & ~g_config.version_mask) | (version_bits & g_config.version_mask);
@@ -570,7 +560,6 @@ int bitcoin_validate_and_submit(const char *job_id,
             memcpy(root_le, curr_root, 32);
             if (share_diff) *share_diff = s_diff;
             
-            // Save successful coin data for block submission
             coin_hex = tmp_hex; // take ownership
             coin_bin = tmp_bin; // take ownership
             coin_bin_len = bin_len;
@@ -590,8 +579,7 @@ int bitcoin_validate_and_submit(const char *job_id,
     uint8_t block_target_be[32];
     nbits_to_target_be(job->nbits_val, block_target_be);
     
-    // We need to re-calc hash for block check (or reuse from loop if we optimized)
-    // Quick re-calc header
+    // Quick re-calc header hash for block check
     uint8_t head[80];
     uint32_t ver = job->version_val;
     if (g_config.version_mask != 0) ver = (ver & ~g_config.version_mask) | (version_bits & g_config.version_mask);
@@ -609,7 +597,6 @@ int bitcoin_validate_and_submit(const char *job_id,
 
     if (is_block) {
         log_info(">>> BLOCK FOUND! Hash via Variant %d", valid_variant);
-        // Build block hex
         size_t cap = 10 * 1024 * 1024;
         char *block_hex = malloc(cap);
         if (block_hex) {

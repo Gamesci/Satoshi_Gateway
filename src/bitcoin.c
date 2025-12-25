@@ -80,20 +80,12 @@ static void div256_u64_be(uint8_t x[32], uint64_t div) {
 
 static bool diff_to_target_be(double diff, uint8_t target_be[32]) {
     if (diff <= 0.0 || !isfinite(diff)) return false;
-    
-    // 初始化 Diff1 Target (0x00000000FFFF0000...)
     uint8_t diff1[32];
     diff1_target_be(diff1);
-
     if (diff < 1.0) diff = 1.0;
-
-    // 将 diff 转换为整数进行除法
     uint64_t diff_int = (uint64_t)diff;
     if (diff_int == 0) diff_int = 1;
-
-    // Target = Diff1 / Diff
     div256_u64_be(diff1, diff_int);
-    
     memcpy(target_be, diff1, 32);
     return true;
 }
@@ -498,6 +490,7 @@ int bitcoin_validate_and_submit(const char *job_id,
                                 const char *ntime_hex,
                                 uint32_t nonce,
                                 uint32_t version_bits,
+                                bool has_version_bits, // New Param
                                 double diff,
                                 double *share_diff) {
     if (share_diff) *share_diff = 0.0;
@@ -539,7 +532,10 @@ int bitcoin_validate_and_submit(const char *job_id,
 
     uint8_t head[80];
     uint32_t ver = job->version_val;
-    if (g_config.version_mask != 0) ver = (ver & ~g_config.version_mask) | (version_bits & g_config.version_mask);
+    // [Fix] 只有在配置了 mask 并且矿工真正提交了 version bits 时才修改版本号
+    if (g_config.version_mask != 0 && has_version_bits) {
+        ver = (ver & ~g_config.version_mask) | (version_bits & g_config.version_mask);
+    }
     put_le32(head + 0, ver);
     memcpy(head + 4, job->prevhash_le, 32);
     memcpy(head + 36, root_le, 32);
@@ -590,41 +586,48 @@ int bitcoin_validate_and_submit(const char *job_id,
         char head_hex[161]; bin2hex_safe(head, 80, head_hex, sizeof(head_hex));
         memcpy(block_hex + pos, head_hex, 160); pos += 160;
 
+        // SegWit Block Format: [Header] [0001] [TxCount] [Tx1] [Tx2] ...
+        // Check if we need to insert SegWit marker
+        bool use_segwit = job->has_segwit;
+        if (use_segwit) {
+            memcpy(block_hex + pos, "0001", 4); pos += 4;
+        }
+
         uint8_t vi[9];
         int vl = encode_varint(vi, (uint64_t)(1 + job->tx_count));
         char vi_hex[19]; 
         if (bin2hex_safe(vi, vl, vi_hex, sizeof(vi_hex))) {
             memcpy(block_hex + pos, vi_hex, strlen(vi_hex)); 
             pos += strlen(vi_hex);
-        } else {
-             memcpy(block_hex + pos, "01", 2); pos += 2;
         }
 
-        if (job->has_segwit) {
-            if (coin_bin_len < 8) {
-                free(block_hex); free(coin_bin); free(coin_hex);
-                pthread_mutex_unlock(&g_tmpl_lock);
-                return 0;
-            }
+        // Coinbase Transaction
+        // If SegWit, we need to restructure the Coinbase to include Witness data
+        // Current `coin_hex` is: [Ver] [In] [Out] [Lock]
+        // SegWit Tx format: [Ver] [00] [01] [In] [Out] [Witness] [Lock]
+        if (use_segwit) {
+            // coin_bin has full Legacy serialization
+            // Version is first 4 bytes
             char part[128];
             bin2hex_safe(coin_bin, 4, part, sizeof(part));
             memcpy(block_hex + pos, part, 8); pos += 8;
+            
+            // Marker & Flag
             memcpy(block_hex + pos, "0001", 4); pos += 4;
             
-            size_t body_len = coin_bin_len - 8; 
+            // Inputs + Outputs (Everything from offset 4 to len-4)
+            size_t body_len = coin_bin_len - 4 - 4; 
             char *body_hex = malloc(body_len * 2 + 1);
-            if (!body_hex) {
-                 free(block_hex); free(coin_bin); free(coin_hex);
-                 pthread_mutex_unlock(&g_tmpl_lock);
-                 return 0;
-            }
+            if (!body_hex) { free(block_hex); free(coin_bin); free(coin_hex); pthread_mutex_unlock(&g_tmpl_lock); return 0; }
             bin2hex_safe(coin_bin + 4, body_len, body_hex, body_len * 2 + 1);
             memcpy(block_hex + pos, body_hex, strlen(body_hex)); pos += strlen(body_hex);
             free(body_hex);
             
+            // Coinbase Witness: 01 (stack items) 20 (len 32) 00...00 (data)
             memcpy(block_hex + pos, "01200000000000000000000000000000000000000000000000000000000000000000", 68);
             pos += 68;
             
+            // LockTime
             bin2hex_safe(coin_bin + coin_bin_len - 4, 4, part, sizeof(part));
             memcpy(block_hex + pos, part, 8); pos += 8;
             
@@ -667,112 +670,93 @@ void bitcoin_update_template(bool force_clean) {
 
     json_t *resp = rpc_call("getblocktemplate", params);
     if (!resp) return;
+
     json_t *res = json_object_get(resp, "result");
     if (!res) { json_decref(resp); return; }
 
-    const char *prev = json_string_value(json_object_get(res, "previousblockhash"));
-    if (!prev || strlen(prev) != 64) { json_decref(resp); return; }
-
-    // RPC returns Big Endian PrevHash. Convert to Little Endian (Internal).
-    uint8_t prev_be[32]; hex2bin_checked(prev, prev_be, 32);
-    uint8_t prev_le[32]; memcpy(prev_le, prev_be, 32); reverse_bytes(prev_le, 32);
-
-    bool clean = force_clean;
     Template tmp;
     template_zero(&tmp);
-    tmp.valid = true;
-
-    static int jid = 0;
-    snprintf(tmp.job_id, sizeof(tmp.job_id), "%08x%08x", (uint32_t)time(NULL), (uint32_t)++jid);
 
     tmp.height = (uint32_t)json_integer_value(json_object_get(res, "height"));
-    tmp.coinbase_value = (int64_t)json_integer_value(json_object_get(res, "coinbasevalue"));
+    tmp.coinbase_value = json_integer_value(json_object_get(res, "coinbasevalue"));
     tmp.version_val = (uint32_t)json_integer_value(json_object_get(res, "version"));
+    uint8_t ver_le[4]; put_le32(ver_le, tmp.version_val);
+    bin2hex_safe(ver_le, 4, tmp.version_hex, 9);
     
-    json_t *jv = json_object_get(res, "versionHex");
-    if (jv && json_is_string(jv)) strncpy(tmp.version_hex, json_string_value(jv), 8);
-    else snprintf(tmp.version_hex, sizeof(tmp.version_hex), "%08x", tmp.version_val);
-
     const char *bits = json_string_value(json_object_get(res, "bits"));
-    if (bits) strncpy(tmp.nbits_hex, bits, 8);
-    tmp.nbits_val = (uint32_t)strtoul(tmp.nbits_hex, NULL, 16);
+    strncpy(tmp.nbits_hex, bits, 9);
+    tmp.nbits_val = (uint32_t)strtoul(bits, NULL, 16);
 
     tmp.curtime_val = (uint32_t)json_integer_value(json_object_get(res, "curtime"));
-    snprintf(tmp.ntime_hex, sizeof(tmp.ntime_hex), "%08x", tmp.curtime_val);
-    memcpy(tmp.prevhash_le, prev_le, 32);
+    uint8_t time_le[4]; put_le32(time_le, tmp.curtime_val);
+    bin2hex_safe(time_le, 4, tmp.ntime_hex, 9);
 
-    uint8_t prev_stratum[32]; memcpy(prev_stratum, prev_le, 32); swap32_buffer(prev_stratum, 32);
-    bin2hex_safe(prev_stratum, 32, tmp.prev_hash_stratum, sizeof(tmp.prev_hash_stratum));
-
-    json_t *txs = json_object_get(res, "transactions");
-    size_t tx_count = (txs && json_is_array(txs)) ? json_array_size(txs) : 0;
-    tmp.tx_count = tx_count;
-
-    if (tx_count > 0) {
-        tmp.txids_le = calloc(tx_count, sizeof(*tmp.txids_le));
-        tmp.tx_hexs = calloc(tx_count, sizeof(char*));
-
-        for (size_t i = 0; i < tx_count; i++) {
-            json_t *tx = json_array_get(txs, i);
-            const char *txid = json_string_value(json_object_get(tx, "txid"));
-            const char *data = json_string_value(json_object_get(tx, "data"));
-            
-            // RPC TxID is Big Endian. Convert to LE (Internal).
-            uint8_t bin[32];
-            hex2bin_checked(txid, bin, 32);
-            memcpy(tmp.txids_le[i], bin, 32); reverse_bytes(tmp.txids_le[i], 32);
-            tmp.tx_hexs[i] = strdup(data);
-        }
-    }
-
-    const char *dwc = NULL;
-    json_t *dw = json_object_get(res, "default_witness_commitment");
-    if (dw && json_is_string(dw)) dwc = json_string_value(dw);
-
-    tmp.has_segwit = (dwc != NULL);
-
-    if (!build_coinbase_hex(tmp.height, tmp.coinbase_value, g_config.coinbase_tag,
-                            tmp.has_segwit, dwc,
-                            4, g_config.extranonce2_size,
-                            tmp.coinb1, sizeof(tmp.coinb1),
-                            tmp.coinb2, sizeof(tmp.coinb2))) {
-        bitcoin_free_job(&tmp); json_decref(resp); return;
-    }
-
-    if (!calculate_merkle_branch_from_txids((const uint8_t (*)[32])tmp.txids_le, tmp.tx_count,
-                                           &tmp.merkle_branch, &tmp.merkle_count)) {
-        bitcoin_free_job(&tmp); json_decref(resp); return;
-    }
-
-    pthread_mutex_lock(&g_tmpl_lock);
-    Template *last = &g_jobs[g_job_head];
+    const char *prev = json_string_value(json_object_get(res, "previousblockhash"));
+    uint8_t ph_bin[32]; hex2bin_checked(prev, ph_bin, 32);
+    // GBT prevhash is BE, we need LE for header and Stratum
+    for(int i=0;i<32;i++) tmp.prevhash_le[i] = ph_bin[31-i];
     
-    // [FIX 2] 作业去重逻辑
+    // Stratum prevhash format is swap32 of LE
+    uint32_t *p32 = (uint32_t*)tmp.prevhash_le;
+    uint8_t sw[32];
+    for(int i=0;i<8;i++) put_le32(sw + i*4, __builtin_bswap32(p32[i]));
+    bin2hex_safe(sw, 32, tmp.prev_hash_stratum, 65);
+
+    // Txs
+    json_t *txs = json_object_get(res, "transactions");
+    tmp.tx_count = json_array_size(txs);
+    tmp.txids_le = malloc((tmp.tx_count + 1) * 32); // +1 for coinbase
+    tmp.tx_hexs = malloc(tmp.tx_count * sizeof(char*));
+    tmp.has_segwit = false;
+
+    // Witness Commitment
+    const char *def_wit = json_string_value(json_object_get(res, "default_witness_commitment"));
+    if (def_wit) {
+        strncpy(tmp.default_witness_commitment, def_wit, 127);
+        tmp.has_segwit = true;
+    }
+
+    for (size_t i = 0; i < tmp.tx_count; i++) {
+        json_t *tx = json_array_get(txs, i);
+        const char *txid = json_string_value(json_object_get(tx, "txid"));
+        const char *hash = json_string_value(json_object_get(tx, "hash"));
+        if (strcmp(txid, hash) != 0) tmp.has_segwit = true; // Simple check
+
+        uint8_t tbin[32]; hex2bin_checked(txid, tbin, 32);
+        for(int k=0;k<32;k++) tmp.txids_le[i][k] = tbin[31-k]; // To LE
+        
+        tmp.tx_hexs[i] = strdup(json_string_value(json_object_get(tx, "data")));
+    }
+
+    // Build Coinbase
+    build_coinbase_hex(tmp.height, tmp.coinbase_value, g_config.pool_tag, 
+                       tmp.has_segwit, tmp.default_witness_commitment,
+                       4, g_config.extranonce2_size, // 4 bytes EN1 + Config EN2
+                       tmp.coinb1, sizeof(tmp.coinb1),
+                       tmp.coinb2, sizeof(tmp.coinb2));
+
+    // Merkle
+    memset(tmp.txids_le[tmp.tx_count], 0, 32); // Coinbase ID placeholder (all 0 for now)
+    calculate_merkle_branch_from_txids(tmp.txids_le, tmp.tx_count, &tmp.merkle_branch, &tmp.merkle_count);
+
+    sprintf(tmp.job_id, "%lx", (unsigned long)time(NULL));
+
+    // Update Global
+    pthread_mutex_lock(&g_tmpl_lock);
+    bool clean = force_clean;
+    if (!g_jobs[g_job_head].valid) clean = true;
+    else if (memcmp(g_jobs[g_job_head].prevhash_le, tmp.prevhash_le, 32) != 0) clean = true;
+
+    // Check if job is different
     bool is_different = false;
-    if (last->valid) {
-        if (strncmp(last->prev_hash_stratum, tmp.prev_hash_stratum, 64) != 0) {
-            // New block (prevhash changed)
-            clean = true;
-            is_different = true;
-        } else {
-            // Same block, check params
-            if (last->curtime_val != tmp.curtime_val ||
-                last->version_val != tmp.version_val ||
-                last->nbits_val != tmp.nbits_val ||
-                last->tx_count != tmp.tx_count) {
-                is_different = true;
-            } else {
-                // Check merkle branches if tx count is same
-                for(size_t k=0; k<tmp.merkle_count; k++) {
-                    if (strcmp(last->merkle_branch[k], tmp.merkle_branch[k]) != 0) {
-                        is_different = true; 
-                        break;
-                    }
-                }
-            }
-        }
-    } else {
-        is_different = true; // First job
+    if (clean) is_different = true;
+    else {
+        // Compare transactions or merkle root if you want strict checking
+        // For now if prevhash is same, we might skip unless tx count differs
+        if (g_jobs[g_job_head].tx_count != tmp.tx_count) is_different = true;
+        // Also check coinb1/coinb2 if needed (e.g. reward change)
+        if (!is_different && g_jobs[g_job_head].coinbase_value != tmp.coinbase_value) is_different = true;
+        if (!g_jobs[g_job_head].valid) is_different = true; // First job
     }
 
     if (!is_different) {

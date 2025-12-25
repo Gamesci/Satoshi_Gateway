@@ -60,6 +60,7 @@ static double nbits_to_diff(uint32_t nbits) {
     double diff = (double)0x0000ffff / (double)(nbits & 0x00ffffff);
     while (shift < 29) { diff *= 256.0; shift++; }
     while (shift > 29) { diff /= 256.0; shift--; }
+    if (!isfinite(diff)) return 0.0;
     return diff;
 }
 

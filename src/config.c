@@ -86,7 +86,7 @@ int load_config(const char *filename) {
     if (g_config.vardiff_target < 1) g_config.vardiff_target = 1;
 
     // [FIX] Calculate bounds using double arithmetic
-    g_config.vardiff_min_diff = g_config.initial_diff / 4.0;
+    g_config.vardiff_min_diff = g_config.initial_diff / 256.0;
     if (g_config.vardiff_min_diff < 1.0) g_config.vardiff_min_diff = 1.0;
     
     // This calculation previously overflowed int32 when initial_diff > 524288

@@ -29,25 +29,44 @@ static void handle_client(int client_sock) {
     // API 请求：/api/stats
     if (strcmp(path, "/api/stats") == 0) {
         json_t *root = stratum_get_stats();
-        json_object_set_new(root, "pool", json_string("Satoshi Gateway"));
-        
-        char *json_str = json_dumps(root, JSON_COMPACT);
-        char header[512];
-        snprintf(header, sizeof(header), 
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: application/json\r\n"
-            "Access-Control-Allow-Origin: *\r\n"
-            "Content-Length: %zu\r\n\r\n", strlen(json_str));
-        
-        send(client_sock, header, strlen(header), 0);
-        send(client_sock, json_str, strlen(json_str), 0);
-        
-        free(json_str);
-        json_decref(root);
+        if (root) {
+            json_object_set_new(root, "pool", json_string("Satoshi Gateway"));
+            
+            // [FIX] json_dumps returns NULL on error (e.g. Inf/NaN values)
+            char *json_str = json_dumps(root, JSON_COMPACT);
+            
+            if (json_str) {
+                char header[512];
+                snprintf(header, sizeof(header), 
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Access-Control-Allow-Origin: *\r\n"
+                    "Content-Length: %zu\r\n\r\n", strlen(json_str));
+                
+                send(client_sock, header, strlen(header), 0);
+                send(client_sock, json_str, strlen(json_str), 0);
+                free(json_str);
+            } else {
+                // 序列化失败（通常是因为 double 包含了 Infinity 或 NaN）
+                const char *err_msg = "{\"error\": \"JSON serialization failed (Possible Inf/NaN in stats)\"}";
+                char header[512];
+                snprintf(header, sizeof(header), 
+                    "HTTP/1.1 500 Internal Server Error\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Access-Control-Allow-Origin: *\r\n"
+                    "Content-Length: %zu\r\n\r\n", strlen(err_msg));
+                send(client_sock, header, strlen(header), 0);
+                send(client_sock, err_msg, strlen(err_msg), 0);
+                log_error("Web API Error: json_dumps returned NULL (Check for Infinity/NaN in stats)");
+            }
+            json_decref(root);
+        } else {
+             const char *err_msg = "{\"error\": \"Failed to retrieve stats\"}";
+             send(client_sock, err_msg, strlen(err_msg), 0);
+        }
     } 
     // 静态文件请求：默认返回 index.html
     else {
-        // 安全起见，只允许访问 index.html，不支持遍历
         char filepath[512];
         snprintf(filepath, sizeof(filepath), "%s/index.html", WEB_ROOT);
 
@@ -67,7 +86,6 @@ static void handle_client(int client_sock) {
                 "Content-Length: %zu\r\n\r\n", filesize);
             send(client_sock, header, strlen(header), 0);
 
-            // Send file content
             while (1) {
                 ssize_t bytes = read(fd, buf, sizeof(buf));
                 if (bytes <= 0) break;

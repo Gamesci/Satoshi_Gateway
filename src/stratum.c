@@ -471,6 +471,22 @@ static void *client_worker(void *arg) {
                         json_object_set_new(res, "result", arr);
                         send_json(c->sock, res);
                         log_info("ID=%d subscribed", c->id);
+                        
+                        // [Compatibility Fix]
+                        // 如果开启了 Version Rolling 且是神马矿机(UserAgent包含Whatsminer)或为了最大兼容性，
+                        // 在 subscribe 成功后（此时矿机已经处于监听状态）发送 mask 通知。
+                        if (g_config.version_mask != 0) {
+                            char ms[16];
+                            snprintf(ms, sizeof(ms), "%08x", g_config.version_mask);
+                            json_t *notif = json_object();
+                            json_object_set_new(notif, "id", json_null());
+                            json_object_set_new(notif, "method", json_string("mining.set_version_mask"));
+                            json_t *nparams = json_array();
+                            json_array_append_new(nparams, json_string(ms));
+                            json_object_set_new(notif, "params", nparams);
+                            send_json(c->sock, notif);
+                            json_decref(notif);
+                        }
                     }
                     else if (strcmp(m, "mining.authorize") == 0) {
                         c->is_authorized = true;
@@ -496,16 +512,8 @@ static void *client_worker(void *arg) {
                         json_object_set_new(res, "result", r);
                         send_json(c->sock, res);
 
-                        // [关键修复] 主动发送 mining.set_version_mask
-                        // 这是 Whatsminer 必须收到的通知，否则无法启用 Version Rolling
-                        json_t *notif = json_object();
-                        json_object_set_new(notif, "id", json_null());
-                        json_object_set_new(notif, "method", json_string("mining.set_version_mask"));
-                        json_t *nparams = json_array();
-                        json_array_append_new(nparams, json_string(ms));
-                        json_object_set_new(notif, "params", nparams);
-                        send_json(c->sock, notif);
-                        json_decref(notif);
+                        // [Fix] Removed proactive set_version_mask here to avoid Bitaxe race condition.
+                        // The mask is already in the result above.
                     }
                     else if (strcmp(m, "mining.submit") == 0) {
                         json_t *p = json_object_get(req, "params");
@@ -522,7 +530,6 @@ static void *client_worker(void *arg) {
                         const char *vh  = NULL;
                         if (json_array_size(p) >= 6) vh = json_string_value(json_array_get(p, 5));
                         
-                        // [关键修复] 解析 Version Bits 参数
                         bool has_version_bits = (vh && strlen(vh) > 0);
 
                         if (!jid || strlen(jid) == 0 ||

@@ -25,7 +25,6 @@ static uint64_t g_share_cache[SHARE_CACHE_SIZE];
 static int g_share_head = 0;
 static pthread_mutex_t g_cache_lock = PTHREAD_MUTEX_INITIALIZER;
 
-// --- Web Stats Globals ---
 #define MAX_SHARE_LOGS 50
 #define HISTORY_POINTS 60 
 
@@ -36,7 +35,6 @@ static pthread_mutex_t g_stats_lock = PTHREAD_MUTEX_INITIALIZER;
 static double g_hashrate_history[HISTORY_POINTS]; 
 static time_t g_last_history_update = 0;
 
-// --- Stats Helpers ---
 static void record_share(const char *ex1, double diff, const char *hash, bool is_block) {
     pthread_mutex_lock(&g_stats_lock);
     int idx = g_share_log_head;
@@ -69,7 +67,6 @@ static void update_global_hashrate_history(double total_hashrate) {
     pthread_mutex_unlock(&g_stats_lock);
 }
 
-// --- Stratum Logic ---
 static uint64_t fnv1a64(const void *data, size_t len) {
     const uint8_t *p = (const uint8_t*)data;
     uint64_t h = 1469598103934665603ULL;
@@ -129,11 +126,10 @@ static Client* client_add(int sock, struct sockaddr_in addr) {
             c->last_retarget_time = time(NULL);
             c->shares_in_window = 0;
             
-            // Stats Init
             c->hashrate_est = 0.0;
             c->last_submit_time = time(NULL);
             c->total_shares = 0;
-            c->best_diff = 0.0;
+            c->best_diff = 0.0; // Init best diff
 
             snprintf(c->extranonce1_hex, sizeof(c->extranonce1_hex), "%08x", (uint32_t)c->id);
             c->last_job_id[0] = '\0';
@@ -313,14 +309,15 @@ void stratum_broadcast_job(Template *tmpl) {
     if (count > 0) log_info("Broadcast job %s to %d miners", tmpl->job_id, count);
 }
 
-// API Export
 json_t* stratum_get_stats(void) {
     json_t *root = json_object();
     json_t *workers = json_array();
     double total_hashrate = 0;
 
+    // --- 计算全局 Best Share (Session) ---
     double global_best_diff = 0;
     char global_best_worker[16] = {0};
+    // ------------------------------------
 
     pthread_mutex_lock(&g_clients_lock);
     for (int i = 0; i < MAX_CLIENTS; i++) {
@@ -336,6 +333,7 @@ json_t* stratum_get_stats(void) {
             json_array_append_new(workers, w);
             total_hashrate += g_clients[i].hashrate_est;
 
+            // 检查是否是当前在线的最佳成绩
             if (g_clients[i].best_diff > global_best_diff) {
                 global_best_diff = g_clients[i].best_diff;
                 snprintf(global_best_worker, sizeof(global_best_worker), "%s", g_clients[i].extranonce1_hex);
@@ -348,6 +346,7 @@ json_t* stratum_get_stats(void) {
 
     json_object_set_new(root, "workers", workers);
 
+    // 1. Block Info & Best Share Info
     uint32_t height = 0;
     int64_t reward = 0;
     uint32_t net_diff = 0;
@@ -357,10 +356,15 @@ json_t* stratum_get_stats(void) {
     json_object_set_new(blk, "height", json_integer(height));
     json_object_set_new(blk, "reward", json_integer(reward));
     json_object_set_new(blk, "net_diff", json_real((double)net_diff));
+    
+    // --- 将最佳 Share 信息也放入 block_info 或者单独字段 ---
     json_object_set_new(blk, "best_diff", json_real(global_best_diff));
     json_object_set_new(blk, "best_worker", json_string(global_best_worker));
+    // ----------------------------------------------------
+    
     json_object_set_new(root, "block_info", blk);
 
+    // 2. Share Logs
     json_t *logs = json_array();
     pthread_mutex_lock(&g_stats_lock);
     for(int i=0; i<MAX_SHARE_LOGS; i++) {
@@ -375,6 +379,7 @@ json_t* stratum_get_stats(void) {
         }
     }
     
+    // 3. Hashrate History
     json_t *hist = json_array();
     for(int i=0; i<HISTORY_POINTS; i++) {
         json_array_append_new(hist, json_real(g_hashrate_history[i]));
@@ -446,7 +451,6 @@ static void *client_worker(void *arg) {
                         send_difficulty(c, c->current_diff);
                         Template t;
                         if (bitcoin_get_latest_job(&t)) {
-                            t.clean_jobs = true; // [FIX 1] Force clean=true on first auth
                             stratum_send_mining_notify(c->sock, &t);
                             bitcoin_free_job(&t);
                         }
@@ -504,7 +508,7 @@ static void *client_worker(void *arg) {
 
                         const char *jid_used = jid;
                         int ret = 0;
-                        double actual_share_diff = 0.0; // [FIX 2] Variable for stats
+                        double actual_share_diff = 0.0; // <--- 保存真实难度
 
                         if (ok_dec) ret = bitcoin_validate_and_submit(jid, full_extranonce, nt, nonce_dec, version_bits, c->current_diff, &actual_share_diff);
                         if (ret == 0 && ok_hex) ret = bitcoin_validate_and_submit(jid, full_extranonce, nt, nonce_hex, version_bits, c->current_diff, &actual_share_diff);
@@ -530,13 +534,12 @@ static void *client_worker(void *arg) {
                             json_object_set_new(res, "result", json_true());
                             json_object_set_new(res, "error", json_null());
 
-                            // Stats Update
                             c->shares_in_window++;
                             c->total_shares++;
                             time_t now = time(NULL);
                             c->last_submit_time = now;
                             
-                            // Update Personal Best
+                            // 更新 Personal Best
                             if (actual_share_diff > c->best_diff) {
                                 c->best_diff = actual_share_diff;
                             }
@@ -548,7 +551,7 @@ static void *client_worker(void *arg) {
                             if (c->hashrate_est == 0) c->hashrate_est = instant_hr;
                             else c->hashrate_est = c->hashrate_est * 0.95 + instant_hr * 0.05;
 
-                            // Record share with actual diff
+                            // 记录日志时使用真实难度
                             record_share(c->extranonce1_hex, actual_share_diff, "Valid Share", (ret == 2));
 
                             double dt = difftime(now, c->last_retarget_time);
@@ -570,7 +573,7 @@ static void *client_worker(void *arg) {
                                     send_difficulty(c, new_diff);
                                     Template t;
                                     if (bitcoin_get_latest_job(&t)) {
-                                        t.clean_jobs = true; // Still force clean on Diff change
+                                        t.clean_jobs = true;
                                         stratum_send_mining_notify(c->sock, &t);
                                         bitcoin_free_job(&t);
                                     }
@@ -599,7 +602,6 @@ static void *client_worker(void *arg) {
             rpos = 0;
         }
     }
-
     client_remove(c);
     return NULL;
 }

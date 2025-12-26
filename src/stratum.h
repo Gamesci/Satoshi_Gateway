@@ -32,6 +32,7 @@ typedef struct {
     char last_job_id[STRATUM_JOBID_MAX];
 
     double current_diff;
+    double previous_diff; // [FIX] 新增：记录上一个难度，用于过渡期验证
     time_t last_retarget_time;
     int shares_in_window;
     
@@ -42,9 +43,9 @@ typedef struct {
     
     double best_diff; 
     
-    // [FIX] 新增：客户端标识
+    // 客户端标识
     char user_agent[128];
-    int coinbase_variant; // 对应 bitcoin.h 中的 CB_VARIANT_*
+    int coinbase_variant; 
 } Client;
 
 void stratum_send_mining_notify(int sock, Template *tmpl);

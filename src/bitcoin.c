@@ -54,7 +54,6 @@ static void nbits_to_target_be(uint32_t nbits, uint8_t target_be[32]) {
     target_be[idx + 2] = mant & 0xff;
 }
 
-// [FIX] Ensure return is double and calculation handles large diffs
 static double nbits_to_diff(uint32_t nbits) {
     int shift = (nbits >> 24) & 0xff;
     double diff = (double)0x0000ffff / (double)(nbits & 0x00ffffff);
@@ -85,8 +84,6 @@ static bool diff_to_target_be(double diff, uint8_t target_be[32]) {
     diff1_target_be(diff1);
     if (diff < 1.0) diff = 1.0;
     uint64_t diff_int = (uint64_t)diff;
-    // Handle huge diffs (Testnet4/Regtest might have very low diff, causing high target)
-    // But here we are converting SHARE diff to target.
     if (diff_int == 0) diff_int = 1;
     div256_u64_be(diff1, diff_int);
     memcpy(target_be, diff1, 32);
@@ -251,7 +248,7 @@ bool bitcoin_get_latest_job(Template *out) {
     return ok;
 }
 
-// ---------- coinbase building ----------
+// ---------- coinbase building (MODIFIED) ----------
 static size_t write_pushdata(uint8_t *dst, size_t cap, const uint8_t *data, size_t len) {
     if (len <= 75) {
         if (cap < 1 + len) return 0;
@@ -274,6 +271,7 @@ static size_t write_pushdata(uint8_t *dst, size_t cap, const uint8_t *data, size
     return 0;
 }
 
+// [MODIFIED] Optimized coinbase builder: removed padding, removed /WM/ tag, stricter length control
 static bool build_coinbase_variant(uint32_t height, int64_t value_sats,
                                    int variant,
                                    bool is_segwit,
@@ -283,24 +281,28 @@ static bool build_coinbase_variant(uint32_t height, int64_t value_sats,
                                    char *coinb1_hex, size_t coinb1_cap,
                                    char *coinb2_hex, size_t coinb2_cap) {
     if (extranonce1_size <= 0 || extranonce2_size <= 0) return false;
-    
+
     // --- ScriptSig Construction ---
-    uint8_t scriptSig[4096];
+    uint8_t scriptSig[256];   // Control max length
     size_t sp = 0;
 
     // 1. BIP34 Height
     uint8_t h_enc[8];
     size_t h_len = 0;
     uint32_t th = height;
-    do { h_enc[h_len++] = (uint8_t)(th & 0xff); th >>= 8; } while (th > 0);
+    do { 
+        h_enc[h_len++] = (uint8_t)(th & 0xff); 
+        th >>= 8; 
+    } while (th > 0);
     if (h_enc[h_len - 1] & 0x80) h_enc[h_len++] = 0x00;
 
     size_t w1 = write_pushdata(scriptSig + sp, sizeof(scriptSig) - sp, h_enc, h_len);
     if (w1 == 0) return false;
     sp += w1;
 
-    // 2. ExtraNonce Opcode & Placeholders
+    // 2. ExtraNonce PUSHDATA (ex1+ex2 occupy one continuous block)
     size_t en_tot = (size_t)(extranonce1_size + extranonce2_size);
+    if (en_tot == 0 || en_tot > 252) return false; // Defense
     if (sizeof(scriptSig) < sp + 3 + en_tot) return false;
 
     if (en_tot <= 75) {
@@ -315,48 +317,47 @@ static bool build_coinbase_variant(uint32_t height, int64_t value_sats,
     }
 
     size_t split_point_1 = sp; 
-    memset(scriptSig + sp, 0, en_tot);
+    memset(scriptSig + sp, 0, en_tot); // Placeholder for ex1+ex2
     sp += en_tot;
     size_t split_point_2 = sp;
 
-    // 3. Variant Specific Padding / Tags
-    // [FIXED] Removed the excessive padding loop.
-    // Replaced with a single short marker to ensure scriptSig length is well below 100 bytes.
-    if (variant == CB_VARIANT_WHATSMINER) {
-        const char *wm_pad = "/WM/";
-        size_t w = write_pushdata(scriptSig + sp, sizeof(scriptSig) - sp, (uint8_t*)wm_pad, strlen(wm_pad));
-        if (w) sp += w;
-    } 
-    
-    // Tag
+    // 3. Variant Specific Tag (Control length)
     const char *tag = g_config.coinbase_tag;
     if (tag && tag[0]) {
         uint8_t tagbuf[64];
         size_t taglen = strlen(tag);
-        if (taglen > 60) taglen = 60;
+        
+        if (variant == CB_VARIANT_WHATSMINER) {
+            if (taglen > 32) taglen = 32;
+        } else if (variant == CB_VARIANT_NICEHASH) {
+            if (taglen > 16) taglen = 16;
+        } else {
+            if (taglen > 60) taglen = 60;
+        }
+
         memcpy(tagbuf, tag, taglen);
-        size_t w3 = write_pushdata(scriptSig + sp, sizeof(scriptSig) - sp, tagbuf, taglen);
-        if (w3 > 0) sp += w3;
+        size_t w_tag = write_pushdata(scriptSig + sp, sizeof(scriptSig) - sp, tagbuf, taglen);
+        if (w_tag > 0) sp += w_tag;
     }
 
-    // --- Coinb1 ---
-    uint8_t tx_prefix[512];
+    // --- Coinb1: TX prefix + scriptSig first part (up to split_point_1) ---
+    uint8_t tx_prefix[64];
     size_t tp = 0;
-    put_le32(tx_prefix + tp, 1); tp += 4; // version
-    tx_prefix[tp++] = 0x01; // vin count
-    memset(tx_prefix + tp, 0, 32); tp += 32; // prevhash (0)
-    put_le32(tx_prefix + tp, 0xffffffffU); tp += 4; // index
+    put_le32(tx_prefix + tp, 1); tp += 4;          // version
+    tx_prefix[tp++] = 0x01;                        // vin count
+    memset(tx_prefix + tp, 0, 32); tp += 32;       // prevhash (0)
+    put_le32(tx_prefix + tp, 0xffffffffU); tp += 4;// index
     tp += encode_varint(tx_prefix + tp, (uint64_t)sp); // Total ScriptSig Len
 
-    uint8_t coinb1_bin[4096];
+    uint8_t coinb1_bin[512];
     if (sizeof(coinb1_bin) < tp + split_point_1) return false;
 
     size_t c1 = 0;
     memcpy(coinb1_bin + c1, tx_prefix, tp); c1 += tp;
     memcpy(coinb1_bin + c1, scriptSig, split_point_1); c1 += split_point_1;
 
-    // --- Coinb2 ---
-    uint8_t coinb2_bin[4096];
+    // --- Coinb2: scriptSig second part + outputs + locktime ---
+    uint8_t coinb2_bin[1024];
     size_t c2 = 0;
     memcpy(coinb2_bin + c2, scriptSig + split_point_2, sp - split_point_2); 
     c2 += (sp - split_point_2);
@@ -396,41 +397,72 @@ static bool build_coinbase_variant(uint32_t height, int64_t value_sats,
     return true;
 }
 
-// [FIX] Correct Merkle Branch (idx^1) and use LE Hex (Bitaxe/Stratum Standard)
-static bool calculate_merkle_branch_correct(const uint8_t (*txids_le)[32], size_t tx_count,
-                                            char ***out_branch, size_t *out_count) {
-    *out_branch = NULL; *out_count = 0;
+// [MODIFIED] Standard Merkle Branch Calculation (coinbase is index 0)
+// No longer assumes sibling is always index 1, handles standard tree building.
+static bool calculate_merkle_branch_standard(const uint8_t (*txids_le)[32],
+                                            size_t tx_count,
+                                            char ***out_branch,
+                                            size_t *out_count) {
+    *out_branch = NULL; 
+    *out_count = 0;
     
-    size_t level_len = 1 + tx_count; // placeholder for coinbase + txs
-    if (level_len == 1) return true; // Only coinbase, no branch
+    // If only coinbase (tx_count=0), branch is empty
+    if (tx_count == 0) return true;
 
-    uint8_t *current_level = calloc(level_len, 32);
-    if (!current_level) return false;
+    size_t leaf_count = tx_count + 1; // coinbase + txs
+    uint8_t *level = calloc(leaf_count, 32);
+    if (!level) return false;
 
-    // Fill level 0. Start at index 1 because index 0 (coinbase) is implicit/varying
+    // level[0] is coinbase, placeholder 0 (content doesn't affect sibling path logic)
+    memset(level, 0, 32);
+    
+    // level[1..] filled with txids_le
     for (size_t i = 0; i < tx_count; i++) {
-        memcpy(current_level + (i + 1) * 32, txids_le[i], 32);
+        memcpy(level + (i + 1) * 32, txids_le[i], 32);
     }
 
     char **branch = calloc(64, sizeof(char*));
-    size_t b_idx = 0;
+    if (!branch) { free(level); return false; }
 
-    while (level_len > 1) {
-        // Since we are tracking the path for Index 0, the sibling is always at Index 1
-        const uint8_t *sibling_le = (level_len > 1) ? (current_level + 32) : current_level;
-        
-        // [FIXED] Use LE Hex directly. Do NOT reverse to BE.
+    size_t branch_len = 0;
+    size_t idx = 0;          // coinbase index
+    size_t curr_count = leaf_count;
+
+    while (curr_count > 1) {
+        size_t sibling_idx = (idx ^ 1);
+        if (sibling_idx >= curr_count) {
+            sibling_idx = idx;  // odd count, last one hashes with itself
+        }
+
+        // Record sibling (LE -> LE hex)
+        const uint8_t *sib = level + sibling_idx * 32;
         char hex[65];
-        bin2hex_safe(sibling_le, 32, hex, sizeof(hex));
-        branch[b_idx++] = strdup(hex);
+        bin2hex_safe(sib, 32, hex, sizeof(hex));
+        branch[branch_len] = strdup(hex);
+        
+        if (!branch[branch_len]) {
+            for (size_t k = 0; k < branch_len; k++) free(branch[k]);
+            free(branch);
+            free(level);
+            return false;
+        }
+        branch_len++;
 
         // Calc next level
-        size_t next_len = (level_len + 1) / 2;
-        uint8_t *next_level = calloc(next_len, 32);
-        
-        for (size_t i = 0; i < next_len; i++) {
-            const uint8_t *left = current_level + (2 * i) * 32;
-            const uint8_t *right = ((2 * i + 1) < level_len) ? (current_level + (2 * i + 1) * 32) : left;
+        size_t next_count = (curr_count + 1) / 2;
+        uint8_t *next_level = calloc(next_count, 32);
+        if (!next_level) {
+            for (size_t k = 0; k < branch_len; k++) free(branch[k]);
+            free(branch);
+            free(level);
+            return false;
+        }
+
+        for (size_t i = 0; i < next_count; i++) {
+            size_t left_idx = 2 * i;
+            size_t right_idx = (2 * i + 1 < curr_count) ? (2 * i + 1) : left_idx;
+            const uint8_t *left = level + left_idx * 32;
+            const uint8_t *right = level + right_idx * 32;
             
             uint8_t cat[64];
             memcpy(cat, left, 32);
@@ -438,14 +470,15 @@ static bool calculate_merkle_branch_correct(const uint8_t (*txids_le)[32], size_
             sha256d(cat, 64, next_level + i * 32);
         }
         
-        free(current_level);
-        current_level = next_level;
-        level_len = next_len;
+        free(level);
+        level = next_level;
+        curr_count = next_count;
+        idx >>= 1;  // Parent index
     }
     
-    free(current_level);
+    free(level);
     *out_branch = branch;
-    *out_count = b_idx;
+    *out_count = branch_len;
     return true;
 }
 
@@ -508,7 +541,6 @@ int bitcoin_validate_and_submit(const char *job_id,
         
         for (size_t k = 0; k < job->merkle_count; k++) {
             uint8_t sib_le[32];
-            // [FIXED] Direct LE Hex -> LE Bin
             hex2bin_checked(job->merkle_branch[k], sib_le, 32);
             
             uint8_t cat[64];
@@ -715,7 +747,8 @@ void bitcoin_update_template(bool force_clean) {
         }
     }
 
-    if (!calculate_merkle_branch_correct((const uint8_t (*)[32])tmp.txids_le, tmp.tx_count,
+    // [MODIFIED] Use standard Merkle Branch calculation
+    if (!calculate_merkle_branch_standard((const uint8_t (*)[32])tmp.txids_le, tmp.tx_count,
                                            &tmp.merkle_branch, &tmp.merkle_count)) {
         bitcoin_free_job(&tmp); json_decref(resp); return;
     }
@@ -773,7 +806,6 @@ void bitcoin_update_template(bool force_clean) {
     json_decref(resp);
 }
 
-// [FIX] Use double for difficulty to prevent INT32_MIN overflow
 void bitcoin_get_telemetry(uint32_t *height, int64_t *reward, double *difficulty) {
     pthread_mutex_lock(&g_tmpl_lock);
     const Template *curr = &g_jobs[g_job_head];

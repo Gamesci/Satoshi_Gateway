@@ -126,7 +126,7 @@ static Client* client_add(int sock, struct sockaddr_in addr) {
             c->is_authorized = false;
 
             c->current_diff = (double)g_config.initial_diff;
-            c->previous_diff = 0.0; // [FIX] 初始化上一个难度
+            c->previous_diff = 0.0;
             c->last_retarget_time = time(NULL);
             c->shares_in_window = 0;
             
@@ -191,7 +191,7 @@ static void send_difficulty(Client *c, double diff) {
     json_decref(res);
 }
 
-// >>>>> [FIX] 修改后的 VarDiff 逻辑 <<<<<
+// >>>>> VarDiff 逻辑 <<<<<
 static void vardiff_check(Client *c) {
     time_t now = time(NULL);
     double dt = difftime(now, c->last_retarget_time);
@@ -222,17 +222,14 @@ static void vardiff_check(Client *c) {
         log_info("VarDiff ID=%d: %.0f -> %.0f (SPM: %.2f, Shares: %d)", 
                  c->id, c->current_diff, new_diff, spm, c->shares_in_window);
         
-        // [FIX] 保存旧难度，以便验证在途的 Share
         c->previous_diff = c->current_diff;
         c->current_diff = new_diff;
         
         send_difficulty(c, new_diff);
         
-        // [FIX] VarDiff 调整时，使用 clean_jobs = false
-        // 这允许矿工提交基于旧难度的 Share，防止被 "Job Not Found" 或 "Low Diff" 拒绝
         Template t;
         if (bitcoin_get_latest_job(&t)) {
-            t.clean_jobs = false; // 只有新区块产生时才设为 true (stratum_broadcast_job)
+            t.clean_jobs = false; 
             stratum_send_mining_notify(c->sock, &t);
             bitcoin_free_job(&t);
         }
@@ -317,14 +314,23 @@ static Client* client_find_by_sock(int sock) {
     return out;
 }
 
+// [MODIFIED] Enhanced detection logic to include MiningRigRentals (MRR)
 static int detect_coinbase_variant(const char *ua) {
     if (!ua) return CB_VARIANT_DEFAULT;
     char ua_lower[128];
-    strncpy(ua_lower, ua, 127); ua_lower[127] = 0;
-    for(int i=0; ua_lower[i]; i++) ua_lower[i] = tolower(ua_lower[i]);
+    strncpy(ua_lower, ua, sizeof(ua_lower) - 1);
+    ua_lower[sizeof(ua_lower) - 1] = '\0';
+    for(int i=0; ua_lower[i]; i++) ua_lower[i] = (char)tolower((unsigned char)ua_lower[i]);
 
+    // Whatsminer
     if (strstr(ua_lower, "whatsminer")) return CB_VARIANT_WHATSMINER;
-    if (strstr(ua_lower, "nicehash")) return CB_VARIANT_NICEHASH;
+    
+    // NiceHash / MRR
+    if (strstr(ua_lower, "nicehash") || 
+        strstr(ua_lower, "miningrigrentals") || 
+        strstr(ua_lower, "mrr")) 
+        return CB_VARIANT_NICEHASH;
+    
     return CB_VARIANT_DEFAULT;
 }
 
@@ -379,8 +385,6 @@ void stratum_broadcast_job(Template *tmpl) {
     for (int i = 0; i < count; i++) {
         stratum_send_mining_notify(sockets[i], tmpl);
     }
-    // [FIX] 新区块必须 clean_jobs=true，此处调用者(Template generator)应该已经设好
-    // 如果是外部调用导致的广播（发现新块），tmpl->clean_jobs 应该是 true
     if (count > 0) log_info("Broadcast job %s (clean=%d) to %d miners", 
                             tmpl->job_id, tmpl->clean_jobs, count);
 }
@@ -553,6 +557,7 @@ static void *client_worker(void *arg) {
                         json_array_append_new(subs, s2);
                         json_array_append_new(arr, subs);
                         json_array_append_new(arr, json_string(c->extranonce1_hex));
+                        // 统一使用全局配置的 Extranonce2
                         json_array_append_new(arr, json_integer(g_config.extranonce2_size));
                         json_object_set_new(res, "result", arr);
                         send_json(c->sock, res);
@@ -626,17 +631,10 @@ static void *client_worker(void *arg) {
                         int ret = 0;
                         double actual_share_diff = 0.0;
                         
-                        // [FIX] 计算验证时使用的"最低接受难度"
-                        // 如果最近有过难度调整，我们允许 "Current" 或者 "Previous" (如果 Previous 存在且小于 Current)
-                        // 但实际上，只要 share_diff >= 该任务当时的难度就行。
-                        // 为了简化：我们尝试用最小难度去验证，看是否是合法的 PoW 格式，然后再检查 actual_share_diff。
                         double check_diff = c->current_diff;
                         if (c->previous_diff > 0.0 && c->previous_diff < check_diff) {
                             check_diff = c->previous_diff;
                         }
-
-                        // 我们传入 check_diff 进行验证。如果难度不够，它可能返回 0，但我们需要 actual_share_diff 来判断是 Low Diff 还是 Invalid
-                        // 如果 bitcoin_validate_and_submit 只有在满足 check_diff 时才返回 !0，那我们这里必须用较低的那个值。
 
                         if (ok_dec) ret = bitcoin_validate_and_submit(jid, full_extranonce, nt, nonce_dec, version_bits, check_diff, &actual_share_diff);
                         if (ret == 0 && ok_hex) ret = bitcoin_validate_and_submit(jid, full_extranonce, nt, nonce_hex, version_bits, check_diff, &actual_share_diff);
@@ -647,7 +645,7 @@ static void *client_worker(void *arg) {
                             if (ret == 0 && ok_hex) ret = bitcoin_validate_and_submit(jid_used, full_extranonce, nt, nonce_hex, version_bits, check_diff, &actual_share_diff);
                         }
 
-                        // [FIX] Duplicate Check (Error 22)
+                        // Duplicate Check (Error 22)
                         char keybuf[256];
                         snprintf(keybuf, sizeof(keybuf), "%s|%s|%s|%s|%s|%d", jid_used, c->extranonce1_hex, en2, nt, nh, c->id);
                         uint64_t fp = fnv1a64(keybuf, strlen(keybuf));
@@ -657,32 +655,22 @@ static void *client_worker(void *arg) {
                             json_decref(res); json_decref(req); start = end + 1; continue;
                         }
 
-                        // [FIX] 分离 Stale (21) 和 Low Difficulty (23)
                         if (ret == 0) {
-                            // ret == 0 意味着验证失败。可能是 Job 找不到，或者 Hash > Target
-                            // 通常 bitcoin_validate_and_submit 会计算 actual_share_diff，即使失败。
-                            // 如果 actual_share_diff 为 0，通常意味着 JobID 无效/过期。
                             if (actual_share_diff < 0.000001) {
                                 json_reply_error(res, 21, "Job not found (=Stale)");
                             } else {
-                                // 如果 actual_share_diff 有值，说明 PoW 计算过了，但是不满足 check_diff
                                 json_reply_error(res, 23, "Low difficulty share");
                             }
                         } else {
-                            // ret != 0，说明满足了 check_diff。
-                            // 现在我们需要确保它满足 "当前难度" 或者 "上一个难度"(如果刚切换)
                             bool accept = false;
                             
                             if (actual_share_diff >= c->current_diff) {
                                 accept = true;
                             } else if (c->previous_diff > 0.0 && actual_share_diff >= c->previous_diff) {
-                                // 允许过渡期的旧难度
                                 accept = true; 
                             }
 
                             if (!accept) {
-                                // 虽然通过了 check_diff (可能 check_diff 是旧的低难度)，但实际上我们现在不想收这么低的了
-                                // 这种情况比较少见（只有当难度突然升高，而 previous 也是低的时候）
                                 json_reply_error(res, 23, "Low difficulty share");
                             } else {
                                 json_object_set_new(res, "result", json_true());
@@ -698,7 +686,7 @@ static void *client_worker(void *arg) {
                                     c->best_diff = actual_share_diff;
                                 }
 
-                                double share_work = c->current_diff * 4294967296.0; // 估算用
+                                double share_work = c->current_diff * 4294967296.0; 
                                 double dt_est = difftime(now, c->last_retarget_time);
                                 if (dt_est < 1.0) dt_est = 1.0;
                                 double instant_hr = share_work / dt_est * c->shares_in_window;

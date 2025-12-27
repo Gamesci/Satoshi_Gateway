@@ -28,11 +28,12 @@ typedef struct {
     bool is_authorized;
     pthread_t thread_id;
 
-    char extranonce1_hex[9];
+    // [MODIFIED] Expanded from [9] to [17] to support up to 8 bytes hex in future
+    char extranonce1_hex[17];
     char last_job_id[STRATUM_JOBID_MAX];
 
     double current_diff;
-    double previous_diff; // [FIX] 新增：记录上一个难度，用于过渡期验证
+    double previous_diff; // 记录上一个难度，用于过渡期验证
     time_t last_retarget_time;
     int shares_in_window;
     

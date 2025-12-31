@@ -9,14 +9,19 @@ typedef struct {
     char rpc_user[128];
     char rpc_pass[128];
     char zmq_addr[256];
+    
+    // [NEW] P2P Config
+    char p2p_host[128];
+    int p2p_port;
+    uint32_t p2p_magic;
+
     char payout_addr[128];
     char coinbase_tag[64];
     int stratum_port;
     int poll_interval_sec;
 
-    // [FIX] Changed to double to prevent integer overflow (2^31 limit)
     double initial_diff;
-    int vardiff_target; // This is shares/minute, int is fine
+    int vardiff_target;
     double vardiff_min_diff;
     double vardiff_max_diff;
 

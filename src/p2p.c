@@ -117,7 +117,11 @@ static void p2p_send_version(int sock, uint32_t magic, int32_t start_height) {
     
     // 使用较新协议版本 70016 (明确支持 Segwit)
     int32_t version = 70016; 
-    uint64_t services = 0; // 我们是轻客户端，不提供服务
+    
+    // [FIXED] 修改 services: 启用 NODE_WITNESS (8)
+    // 这是必须的，否则 Bitcoin Core 可能会忽略我们的 sendcmpct(2) 请求
+    uint64_t services = 8; 
+    
     int64_t ts = time(NULL);
     uint64_t nonce = 0x5a705a705a705a70;
 
@@ -131,9 +135,12 @@ static void p2p_send_version(int sock, uint32_t magic, int32_t start_height) {
     // 告知节点我们已同步的高度，防止被当作 IBD 节点而拒绝推送
     memcpy(payload + 81, &start_height, 4);
     
-    // relay flag (偏移量 85) 默认为 0
+    // [FIXED] 显式开启 Relay (偏移量 85)
+    uint8_t relay = 1;
+    memcpy(payload + 85, &relay, 1);
 
-    p2p_send_msg(sock, magic, "version", payload, 85);
+    // [FIXED] 发送完整的 86 字节
+    p2p_send_msg(sock, magic, "version", payload, 86);
 }
 
 static void p2p_send_sendcmpct(int sock, uint32_t magic) {

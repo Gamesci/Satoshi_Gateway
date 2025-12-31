@@ -19,6 +19,7 @@
 
 #define P2P_RECV_BUF_SIZE (4 * 1024 * 1024) 
 #define P2P_CONNECT_TIMEOUT 5
+#define GETHEADERS_INTERVAL 30  // [新增] 每30秒发送一次 getheaders 保活
 
 #pragma pack(push, 1)
 typedef struct {
@@ -79,7 +80,8 @@ static int p2p_connect(const char* host, int port) {
     }
 
     fcntl(sock, F_SETFL, flags);
-    struct timeval rtv = {60, 0}; 
+    // [调整] 将接收超时改为 1 秒，以便主循环能更频繁地检查是否需要发送 getheaders
+    struct timeval rtv = {1, 0}; 
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&rtv, sizeof(rtv));
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&rtv, sizeof(rtv));
 
@@ -108,7 +110,7 @@ static void p2p_send_version(int sock, uint32_t magic, int32_t start_height) {
     memset(payload, 0, sizeof(payload));
     
     int32_t version = 70016; 
-    // [修正] 启用 NODE_WITNESS (8)
+    // [保留] 启用 NODE_WITNESS (8)，配合 Compact Block V2
     uint64_t services = 8; 
     
     int64_t ts = time(NULL);
@@ -121,7 +123,7 @@ static void p2p_send_version(int sock, uint32_t magic, int32_t start_height) {
     
     memcpy(payload + 81, &start_height, 4);
     
-    // [修正] 显式开启 Relay
+    // [保留] 显式开启 Relay
     uint8_t relay = 1;
     memcpy(payload + 85, &relay, 1);
 
@@ -129,20 +131,49 @@ static void p2p_send_version(int sock, uint32_t magic, int32_t start_height) {
 }
 
 static void p2p_send_sendcmpct(int sock, uint32_t magic) {
-    // 构造 payload: [bool announce=1] [uint64_t version]
     uint8_t payload[9];
     
-    // 发送 Version 1
+    // Version 1
     payload[0] = 1; // High Bandwidth
     uint64_t v1 = 1; 
     memcpy(payload + 1, &v1, 8);
     p2p_send_msg(sock, magic, "sendcmpct", payload, 9);
 
-    // 发送 Version 2
+    // Version 2 (首选)
     payload[0] = 1; // High Bandwidth
     uint64_t v2 = 2;
     memcpy(payload + 1, &v2, 8);
     p2p_send_msg(sock, magic, "sendcmpct", payload, 9);
+}
+
+// [新增] 发送 getheaders 以保持活跃并维持 Synced 状态
+static void p2p_send_getheaders(int sock, uint32_t magic) {
+    // 获取当前已知的最新 Job，从中提取 PrevHash
+    Template tmpl;
+    if (!bitcoin_get_latest_job(&tmpl)) {
+        return; // 还没有 Job，暂时不发
+    }
+    
+    // 构造 payload
+    // Version (4) + VarInt Count (1) + Hash (32) + StopHash (32) = 69 bytes
+    uint8_t payload[69]; 
+    memset(payload, 0, sizeof(payload));
+    
+    int32_t version = 70016;
+    memcpy(payload, &version, 4);
+    
+    payload[4] = 1; // VarInt: Count = 1
+    
+    // 当前我们已知的最新块哈希 (即 Job 的 PrevHash)
+    // 注意：tmpl.prevhash_le 已经是小端序，直接复制即可
+    memcpy(payload + 5, tmpl.prevhash_le, 32);
+    
+    // StopHash 全 0 (memset已处理)
+
+    p2p_send_msg(sock, magic, "getheaders", payload, 69);
+    
+    // 释放 Job 内存
+    bitcoin_free_job(&tmpl);
 }
 
 static void p2p_handle_message(const char* cmd, const uint8_t* payload, uint32_t len) {
@@ -154,12 +185,9 @@ static void p2p_handle_message(const char* cmd, const uint8_t* payload, uint32_t
     else if (strcmp(cmd, "block") == 0 && len >= 80) {
         header_ptr = payload;
     }
-    // 处理 headers 消息（通常是对 getheaders 的响应，但也可能用于新块通知）
     else if (strcmp(cmd, "headers") == 0 && len > 0) {
-        uint64_t count = payload[0]; // 变长整数简化处理，假设 < 0xfd
+        uint64_t count = payload[0]; 
         if (count > 0 && len >= 81) {
-             // 这里的偏移量 1 是基于假设 VarInt 为 1 字节
-             // 实际上如果是 INV 触发的 headers，通常只有一个
              header_ptr = payload + 1;
         }
     }
@@ -169,13 +197,10 @@ static void p2p_handle_message(const char* cmd, const uint8_t* payload, uint32_t
             if (count > 0 && len >= 1 + 36) {
                 uint32_t type;
                 memcpy(&type, payload + 1, 4);
-                if (type == 2) { // MSG_BLOCK
-                    log_info("P2P Warning: Received INV for Block. Pushing not active yet or peer restricted.");
-                    
-                    // [新增] 如果收到 INV，说明 High Bandwidth 未生效或被回退。
-                    // 我们可以尝试发送 getdata 来请求这个块（虽然慢一点，但能工作）
-                    // 但为了保持轻量，我们暂时只记录警告。
-                    // 理想情况下，握手顺序修正后这里不应该被频繁触发。
+                if (type == 2) { 
+                    // 收到 INV 意味着推送机制暂时未生效。
+                    // 现在的 getheaders 机制应该能逐渐消除这个警告。
+                    log_info("P2P Warning: Received INV for Block (Fallback mode).");
                 }
             }
         }
@@ -212,31 +237,36 @@ static void *p2p_thread_func(void *arg) {
 
         log_info("P2P: Connected. Handshaking...");
         
-        // --- 握手序列调整 (重要) ---
-        // 1. 发送 Version
+        // --- 握手序列 (保留优化后的顺序) ---
         p2p_send_version(sock, cfg->magic, cfg->start_height);
-        
-        // 2. 发送 WtxidRelay (必须在 Verack 之前)
-        // 这是启用 Compact Blocks V2 的先决条件
-        p2p_send_msg(sock, cfg->magic, "wtxidrelay", NULL, 0);
-        
-        // 3. 发送 SendCmpct (请求 High Bandwidth 模式)
-        // 建议在 Verack 之前发送，以便 Verack 后立即生效
-        p2p_send_sendcmpct(sock, cfg->magic);
-
-        // 4. 发送 Verack (确认握手)
+        p2p_send_msg(sock, cfg->magic, "wtxidrelay", NULL, 0); // 必须在 Verack 前
+        p2p_send_sendcmpct(sock, cfg->magic); // 请求 High Bandwidth
         p2p_send_msg(sock, cfg->magic, "verack", NULL, 0);
         
-        // 5. [可选] 发送 Ping 以保持活跃并确认连接状态
-        // uint64_t nonce = 0;
-        // p2p_send_msg(sock, cfg->magic, "ping", &nonce, 8);
-
         int buf_len = 0;
         bool handshake_done = false;
+        
+        // [新增] 计时器
+        time_t last_getheaders_time = 0;
 
         while (g_p2p_running) {
+            // [新增] 定期发送 getheaders 保活 (逻辑A方案)
+            time_t now = time(NULL);
+            if (handshake_done && (now - last_getheaders_time >= GETHEADERS_INTERVAL)) {
+                p2p_send_getheaders(sock, cfg->magic);
+                last_getheaders_time = now;
+                // 可选：打印日志确认保活
+                // log_info("P2P: Sent periodic getheaders to keep high-bandwidth mode");
+            }
+
+            // 接收数据 (1秒超时，保证上面的定时器能被及时触发)
             ssize_t n = recv(sock, recv_buf + buf_len, P2P_RECV_BUF_SIZE - buf_len, 0);
+            
             if (n <= 0) {
+                // 检查是否是超时 (EAGAIN/EWOULDBLOCK)
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    continue; // 只是超时，继续循环检查定时器
+                }
                 log_error("P2P: Socket disconnected");
                 break;
             }
@@ -259,6 +289,10 @@ static void *p2p_thread_func(void *arg) {
                 if (!handshake_done && strcmp(cmd, "verack") == 0) {
                     handshake_done = true;
                     log_info("P2P: Handshake complete! (Push Activated)");
+                    
+                    // 握手完成后立即发送一次 getheaders，加速状态同步
+                    p2p_send_getheaders(sock, cfg->magic);
+                    last_getheaders_time = time(NULL);
                 }
 
                 if (strcmp(cmd, "ping") == 0 && hdr->length == 8) {

@@ -149,9 +149,10 @@ static void p2p_send_sendcmpct(int sock, uint32_t magic) {
 // [新增] 发送 getheaders 以保持活跃并维持 Synced 状态
 static void p2p_send_getheaders(int sock, uint32_t magic) {
     // 获取当前已知的最新 Job，从中提取 PrevHash
+    // 这保证了我们向节点汇报的 "我们有的区块" 与 bitcoin.c 中的挖矿任务是完全一致的
     Template tmpl;
     if (!bitcoin_get_latest_job(&tmpl)) {
-        return; // 还没有 Job，暂时不发
+        return; // 还没有 Job (可能还在初始化)，暂时不发
     }
     
     // 构造 payload
@@ -164,15 +165,16 @@ static void p2p_send_getheaders(int sock, uint32_t magic) {
     
     payload[4] = 1; // VarInt: Count = 1
     
-    // 当前我们已知的最新块哈希 (即 Job 的 PrevHash)
-    // 注意：tmpl.prevhash_le 已经是小端序，直接复制即可
+    // 关键点：使用 prevhash_le (Little Endian)
+    // 这是 bitcoin.c 维护的原始小端序哈希，完全符合 P2P 协议标准
+    // 注意：不要使用 prev_hash_stratum (那是 Swap 过的)
     memcpy(payload + 5, tmpl.prevhash_le, 32);
     
     // StopHash 全 0 (memset已处理)
 
     p2p_send_msg(sock, magic, "getheaders", payload, 69);
     
-    // 释放 Job 内存
+    // 释放 Job 内存 (bitcoin_get_latest_job 会做深拷贝)
     bitcoin_free_job(&tmpl);
 }
 

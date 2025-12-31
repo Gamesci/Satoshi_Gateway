@@ -1,9 +1,13 @@
 {
   "rpc_url": "http://127.0.0.1:8332",
   "rpc_user": "bitcoinrpc",
-  "rpc_pass": "change_me",
+  "rpc_pass": "your_password",
 
   "zmq_pub_hashblock": "tcp://127.0.0.1:28332",
+
+  "p2p_host": "127.0.0.1",
+  "p2p_port": 8333,
+  "p2p_magic": "d9b4bef9",
 
   "reward_address": "bc1qxxxxxxxxxxxxxxxxxxxxxxxx",
   "pool_tag": "/SatoshiGateway/",

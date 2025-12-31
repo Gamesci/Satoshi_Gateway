@@ -10,6 +10,7 @@
 #include <sys/socket.h>
 #include <pthread.h>
 #include <sys/select.h>
+#include <netdb.h>
 
 #include "p2p.h"
 #include "bitcoin.h"
@@ -30,15 +31,7 @@ typedef struct {
 
 static volatile bool g_p2p_running = true;
 
-// 辅助：计算 Block Subsidy (防止空块引用了上一块的手续费)
-static int64_t calc_subsidy(int height) {
-    int halvings = height / 210000;
-    if (halvings >= 64) return 0;
-    int64_t subsidy = 5000000000LL; // 50 BTC
-    return subsidy >> halvings;
-}
-
-static int p2p_connect(const char* ip, int port) {
+static int p2p_connect(const char* host, int port) {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) return -1;
 
@@ -50,7 +43,18 @@ static int p2p_connect(const char* ip, int port) {
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
-    inet_pton(AF_INET, ip, &addr.sin_addr);
+
+    struct hostent *he;
+    // 尝试将其视为 IP 地址
+    if (inet_pton(AF_INET, host, &addr.sin_addr) <= 0) {
+        // 如果不是 IP，尝试作为域名/主机名解析
+        if ((he = gethostbyname(host)) == NULL) {
+            log_error("P2P: Failed to resolve hostname: %s", host);
+            close(sock);
+            return -1;
+        }
+        memcpy(&addr.sin_addr, he->h_addr_list[0], he->h_length);
+    }
 
     int res = connect(sock, (struct sockaddr*)&addr, sizeof(addr));
     if (res < 0 && errno != EINPROGRESS) {
@@ -108,7 +112,7 @@ static void p2p_send_version(int sock, uint32_t magic) {
     uint8_t payload[86];
     memset(payload, 0, sizeof(payload));
     
-    int32_t version = 70015; // Version > 70014 for CMPCTBLOCK
+    int32_t version = 70015; 
     uint64_t services = 0;
     int64_t ts = time(NULL);
     uint64_t nonce = 0x5a705a705a705a70;
@@ -117,15 +121,14 @@ static void p2p_send_version(int sock, uint32_t magic) {
     memcpy(payload + 4, &services, 8);
     memcpy(payload + 12, &ts, 8);
     memcpy(payload + 72, &nonce, 8);
-    // rest is 0 (addr_recv, addr_from, user_agent, start_height)
     
     p2p_send_msg(sock, magic, "version", payload, 85);
 }
 
 static void p2p_send_sendcmpct(int sock, uint32_t magic) {
     uint8_t payload[9];
-    payload[0] = 1; // bool announce (1 = high bandwidth, send immediately)
-    uint64_t version = 1; // version 1 (BIP152) - works for most
+    payload[0] = 1; 
+    uint64_t version = 1; 
     memcpy(payload + 1, &version, 8);
     p2p_send_msg(sock, magic, "sendcmpct", payload, 9);
 }
@@ -133,55 +136,45 @@ static void p2p_send_sendcmpct(int sock, uint32_t magic) {
 static void p2p_handle_message(const char* cmd, const uint8_t* payload, uint32_t len) {
     const uint8_t *header_ptr = NULL;
 
-    // Support both cmpctblock (BIP152) and headers
     if (strcmp(cmd, "cmpctblock") == 0 && len >= 80) {
-        // [Header 80b] [Nonce 8b] ...
         header_ptr = payload;
     } 
     else if (strcmp(cmd, "headers") == 0 && len > 80) {
-        // [Count VarInt] [Header 80b] [TxCount VarInt=0] ...
-        // Simple parser: assuming count=1 and it fits
         if (payload[0] > 0) {
             header_ptr = payload + 1;
         }
     }
-    // Also support 'block' message if small enough (unlikely for full blocks)
     else if (strcmp(cmd, "block") == 0 && len >= 80) {
         header_ptr = payload;
     }
 
     if (header_ptr) {
-        // Trigger Fast Block Logic in bitcoin.c
         bitcoin_fast_new_block(header_ptr);
     }
 }
 
 static void *p2p_thread_func(void *arg) {
-    struct { char ip[64]; int port; uint32_t magic; } *cfg = arg;
+    struct { char host[64]; int port; uint32_t magic; } *cfg = arg;
     
-    log_info("P2P: Listener starting on %s:%d (Magic: 0x%08x)", cfg->ip, cfg->port, cfg->magic);
+    log_info("P2P: Listener starting on %s:%d (Magic: 0x%08x)", cfg->host, cfg->port, cfg->magic);
     
     uint8_t *recv_buf = malloc(P2P_RECV_BUF_SIZE);
     if (!recv_buf) return NULL;
     
     while (g_p2p_running) {
-        int sock = p2p_connect(cfg->ip, cfg->port);
+        int sock = p2p_connect(cfg->host, cfg->port);
         if (sock < 0) {
-            log_error("P2P: Connect failed, retrying in 5s...");
+            log_error("P2P: Connect to %s failed, retrying in 5s...", cfg->host);
             sleep(5);
             continue;
         }
 
-        log_info("P2P: Connected. Sending Handshake...");
+        log_info("P2P: Connected to %s. Sending Handshake...", cfg->host);
         
-        // Handshake sequence
         p2p_send_version(sock, cfg->magic);
         p2p_send_msg(sock, cfg->magic, "verack", NULL, 0);
         p2p_send_sendcmpct(sock, cfg->magic);
         
-        // Send "ping" occasionally to keep alive? Node sends ping, we should pong.
-        // For simplicity, we just listen. If node disconnects, we reconnect.
-
         int buf_len = 0;
         bool handshake_done = false;
 
@@ -200,7 +193,7 @@ static void *p2p_thread_func(void *arg) {
                     goto reconnect;
                 }
 
-                if (buf_len < 24 + hdr->length) break; // Incomplete
+                if (buf_len < 24 + hdr->length) break; 
 
                 char cmd[13] = {0};
                 memcpy(cmd, hdr->command, 12);
@@ -210,15 +203,12 @@ static void *p2p_thread_func(void *arg) {
                     log_info("P2P: Handshake complete! Ready for blocks.");
                 }
 
-                // Handle Pong
                 if (strcmp(cmd, "ping") == 0 && hdr->length == 8) {
                     p2p_send_msg(sock, cfg->magic, "pong", recv_buf + 24, 8);
                 }
 
-                // Handle Data
                 p2p_handle_message(cmd, recv_buf + 24, hdr->length);
 
-                // Move buffer
                 uint32_t total_len = 24 + hdr->length;
                 memmove(recv_buf, recv_buf + total_len, buf_len - total_len);
                 buf_len -= total_len;
@@ -235,16 +225,16 @@ static void *p2p_thread_func(void *arg) {
     return NULL;
 }
 
-int p2p_start_thread(const char *ip, int port, uint32_t magic) {
+int p2p_start_thread(const char *host, int port, uint32_t magic) {
     pthread_t t;
     void *arg = malloc(128);
-    char *ip_ptr = (char*)arg;
-    strncpy(ip_ptr, ip, 64);
+    char *host_ptr = (char*)arg;
+    strncpy(host_ptr, host, 64);
     
-    int *port_ptr = (int*)(ip_ptr + 64);
+    int *port_ptr = (int*)(host_ptr + 64);
     *port_ptr = port;
     
-    uint32_t *magic_ptr = (uint32_t*)(ip_ptr + 68);
+    uint32_t *magic_ptr = (uint32_t*)(host_ptr + 68);
     *magic_ptr = magic;
 
     return pthread_create(&t, NULL, p2p_thread_func, arg);

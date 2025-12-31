@@ -11,6 +11,7 @@
 #include "utils.h"
 #include "zmq_listener.h"
 #include "web.h"
+#include "p2p.h" // [NEW]
 
 volatile sig_atomic_t g_block_notify = 0;
 static void handle_signal(int sig) { if (sig == SIGUSR1) g_block_notify = 1; }
@@ -21,7 +22,7 @@ int main(int argc, char *argv[]) {
     const char *conf_file = "config.json";
     if (argc > 2 && strcmp(argv[1], "-c") == 0) conf_file = argv[2];
 
-    log_info("Starting Satoshi Gateway...");
+    log_info("Starting Satoshi Gateway (Production)...");
     if (load_config(conf_file) != 0) {
         log_error("Config load failed.");
         return 1;
@@ -36,19 +37,23 @@ int main(int argc, char *argv[]) {
     if (bitcoin_init() != 0) return 1;
     if (stratum_start_thread() != 0) return 1;
 
+    // Start ZMQ listener (Safe updates)
     zmq_listener_start();
+
+    // [NEW] Start P2P listener (Fast updates)
+    p2p_start_thread(g_config.p2p_host, g_config.p2p_port, g_config.p2p_magic);
     
-    // 启动 Web 面板，端口固定 8080
     web_server_start(8080); 
 
-    log_info("Gateway ready on stratum port %d", g_config.stratum_port);
+    log_info("Gateway ready on port %d. Monitoring P2P: %s:%d", 
+             g_config.stratum_port, g_config.p2p_host, g_config.p2p_port);
 
     bitcoin_update_template(true);
     time_t last_check = time(NULL);
 
     while (1) {
         if (g_block_notify) {
-            log_info("Signal: new block");
+            log_info("Signal: new block (ZMQ/RPC)");
             g_block_notify = 0;
             bitcoin_update_template(true);
             last_check = time(NULL);

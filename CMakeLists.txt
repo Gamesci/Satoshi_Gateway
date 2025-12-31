@@ -13,9 +13,9 @@ add_executable(satoshi_gateway
     src/bitcoin.c
     src/zmq_listener.c
     src/web.c
+    src/p2p.c  # [NEW]
 )
 
-# Warnings / flags
 target_compile_options(satoshi_gateway PRIVATE -Wall -Wextra -O2 -g -D_GNU_SOURCE -pthread)
 
 find_package(PkgConfig REQUIRED)
@@ -32,7 +32,6 @@ target_include_directories(satoshi_gateway PRIVATE
     ${ZMQ_INCLUDE_DIRS}
 )
 
-# Carry pkg-config extra flags (more portable)
 target_compile_options(satoshi_gateway PRIVATE
     ${JANSSON_CFLAGS_OTHER}
     ${CURL_CFLAGS_OTHER}

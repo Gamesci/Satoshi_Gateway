@@ -17,12 +17,22 @@
 #include "stratum.h"
 #include "utils.h"
 #include "sha256.h"
+#include "p2p.h" // 引用 P2P 相关定义
 
 static Template g_jobs[MAX_JOB_HISTORY];
 static int g_job_head = 0;
 static pthread_mutex_t g_tmpl_lock = PTHREAD_MUTEX_INITIALIZER;
 
 // ---------- helpers ----------
+
+// [NEW] Helper: Calculate block subsidy (halving logic)
+static int64_t calc_subsidy(int height) {
+    int halvings = height / 210000;
+    if (halvings >= 64) return 0;
+    int64_t subsidy = 5000000000LL; // 50 BTC start
+    return subsidy >> halvings;
+}
+
 static int cmp256_be(const uint8_t a[32], const uint8_t b[32]) {
     for (int i = 0; i < 32; i++) {
         if (a[i] < b[i]) return -1;
@@ -248,7 +258,7 @@ bool bitcoin_get_latest_job(Template *out) {
     return ok;
 }
 
-// ---------- coinbase building (MODIFIED) ----------
+// ---------- coinbase building ----------
 static size_t write_pushdata(uint8_t *dst, size_t cap, const uint8_t *data, size_t len) {
     if (len <= 75) {
         if (cap < 1 + len) return 0;
@@ -271,7 +281,6 @@ static size_t write_pushdata(uint8_t *dst, size_t cap, const uint8_t *data, size
     return 0;
 }
 
-// [MODIFIED] Optimized coinbase builder: removed padding, removed /WM/ tag, stricter length control
 static bool build_coinbase_variant(uint32_t height, int64_t value_sats,
                                    int variant,
                                    bool is_segwit,
@@ -397,8 +406,6 @@ static bool build_coinbase_variant(uint32_t height, int64_t value_sats,
     return true;
 }
 
-// [MODIFIED] Standard Merkle Branch Calculation (coinbase is index 0)
-// No longer assumes sibling is always index 1, handles standard tree building.
 static bool calculate_merkle_branch_standard(const uint8_t (*txids_le)[32],
                                             size_t tx_count,
                                             char ***out_branch,
@@ -496,6 +503,110 @@ static int bitcoin_submit_block(const char *hex_data) {
     return success;
 }
 
+// [NEW] P2P Fast Block Switch
+void bitcoin_fast_new_block(const uint8_t *header_80_bytes) {
+    if (!header_80_bytes) return;
+
+    // 1. Calculate new block hash (which is our new PrevHash)
+    uint8_t new_hash[32];
+    sha256_double(header_80_bytes, 80, new_hash);
+
+    pthread_mutex_lock(&g_tmpl_lock);
+    
+    Template *curr = &g_jobs[g_job_head];
+    if (!curr->valid) {
+        pthread_mutex_unlock(&g_tmpl_lock);
+        return;
+    }
+
+    // 2. Anti-Replay: If we are already mining on this hash, ignore
+    if (memcmp(curr->prevhash_le, new_hash, 32) == 0) {
+        pthread_mutex_unlock(&g_tmpl_lock);
+        return;
+    }
+
+    // 3. Switch if incoming PrevHash != Current Job PrevHash
+    // This implies a new block on the network.
+    uint8_t incoming_prev[32];
+    memcpy(incoming_prev, header_80_bytes + 4, 32);
+
+    log_info("⚡ P2P Signal: New Block Detected!");
+
+    // --- Build Empty Block Job ---
+    int next_head = (g_job_head + 1) % MAX_JOB_HISTORY;
+    Template *next = &g_jobs[next_head];
+    bitcoin_free_job(next);
+
+    // Copy basics from current job (assume rules haven't changed in 1 block)
+    *next = *curr;
+    next->merkle_branch = NULL;
+    next->tx_hexs = NULL;
+    next->txids_le = NULL;
+    next->tx_count = 0; // EMPTY BLOCK
+    next->has_segwit = false; // No segwit commitment needed for empty block
+
+    // Set new PrevHash
+    memcpy(next->prevhash_le, new_hash, 32);
+    
+    // Swap for Stratum
+    uint8_t tmp_swap[32];
+    memcpy(tmp_swap, new_hash, 32);
+    swap32_buffer(tmp_swap, 32);
+    bin2hex_safe(tmp_swap, 32, next->prev_hash_stratum, sizeof(next->prev_hash_stratum));
+
+    // Extract nBits and Version from the new header
+    memcpy(&next->version_val, header_80_bytes, 4);
+    memcpy(&next->nbits_val, header_80_bytes + 72, 4);
+    snprintf(next->version_hex, 9, "%08x", next->version_val);
+    snprintf(next->nbits_hex, 9, "%08x", next->nbits_val);
+
+    // Increase Height
+    next->height = curr->height + 1;
+    
+    // Reset Time
+    next->curtime_val = (uint32_t)time(NULL);
+    snprintf(next->ntime_hex, 9, "%08x", next->curtime_val);
+
+    // Generate Fast Job ID
+    static int fast_cnt = 0;
+    snprintf(next->job_id, sizeof(next->job_id), "FAST%x", ++fast_cnt);
+    next->clean_jobs = true; // FORCE SWITCH
+
+    // Recalculate Reward (Subsidy Only, No Fees)
+    next->coinbase_value = calc_subsidy(next->height);
+
+    // Rebuild Coinbase
+    bool build_ok = true;
+    for (int v = 0; v < MAX_COINBASE_VARIANTS; v++) {
+        if (!build_coinbase_variant(next->height, next->coinbase_value, 
+                                    v, false, NULL, 
+                                    4, g_config.extranonce2_size,
+                                    next->coinb1[v], sizeof(next->coinb1[v]),
+                                    next->coinb2[v], sizeof(next->coinb2[v]))) {
+            build_ok = false;
+        }
+    }
+
+    if (!build_ok) {
+        log_error("FastBlock: Failed to build coinbase");
+        pthread_mutex_unlock(&g_tmpl_lock);
+        return;
+    }
+
+    // Merkle Root for Empty Block is just the Coinbase Hash
+    next->merkle_count = 0;
+    next->merkle_branch = NULL; 
+
+    // Commit
+    g_job_head = next_head;
+    Template notify = *next;
+    
+    pthread_mutex_unlock(&g_tmpl_lock);
+
+    log_info("🚀 Switching to Empty Block %s (H:%d) via P2P", next->prev_hash_stratum, next->height);
+    stratum_broadcast_job(&notify);
+}
+
 int bitcoin_validate_and_submit(const char *job_id,
                                 const char *full_extranonce_hex,
                                 const char *ntime_hex,
@@ -539,6 +650,7 @@ int bitcoin_validate_and_submit(const char *job_id,
         uint8_t curr_root[32];
         memcpy(curr_root, cb_txid, 32);
         
+        // Loop is skipped if merkle_count == 0 (empty block case)
         for (size_t k = 0; k < job->merkle_count; k++) {
             uint8_t sib_le[32];
             hex2bin_checked(job->merkle_branch[k], sib_le, 32);
@@ -747,7 +859,6 @@ void bitcoin_update_template(bool force_clean) {
         }
     }
 
-    // [MODIFIED] Use standard Merkle Branch calculation
     if (!calculate_merkle_branch_standard((const uint8_t (*)[32])tmp.txids_le, tmp.tx_count,
                                            &tmp.merkle_branch, &tmp.merkle_count)) {
         bitcoin_free_job(&tmp); json_decref(resp); return;

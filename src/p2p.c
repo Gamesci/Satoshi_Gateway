@@ -19,7 +19,7 @@
 
 #define P2P_RECV_BUF_SIZE (4 * 1024 * 1024) 
 #define P2P_CONNECT_TIMEOUT 5
-#define GETHEADERS_INTERVAL 30  // [新增] 每30秒发送一次 getheaders 保活
+#define GETHEADERS_INTERVAL 40
 
 #pragma pack(push, 1)
 typedef struct {

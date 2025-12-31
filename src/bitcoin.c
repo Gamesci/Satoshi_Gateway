@@ -554,9 +554,10 @@ void bitcoin_fast_new_block(const uint8_t *header_80_bytes) {
     swap32_buffer(tmp_swap, 32);
     bin2hex_safe(tmp_swap, 32, next->prev_hash_stratum, sizeof(next->prev_hash_stratum));
 
-    // Extract nBits and Version from the new header
-    memcpy(&next->version_val, header_80_bytes, 4);
-    memcpy(&next->nbits_val, header_80_bytes + 72, 4);
+// [优化] 使用本地 GBT 的 version 和 nbits
+    next->version_val = curr->version_val;
+    next->nbits_val = curr->nbits_val;
+    // 重新生成 Hex 字符串 (确保格式一致)
     snprintf(next->version_hex, 9, "%08x", next->version_val);
     snprintf(next->nbits_hex, 9, "%08x", next->nbits_val);
 

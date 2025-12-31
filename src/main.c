@@ -11,7 +11,7 @@
 #include "utils.h"
 #include "zmq_listener.h"
 #include "web.h"
-#include "p2p.h" // [NEW]
+#include "p2p.h"
 
 volatile sig_atomic_t g_block_notify = 0;
 static void handle_signal(int sig) { if (sig == SIGUSR1) g_block_notify = 1; }
@@ -37,19 +37,29 @@ int main(int argc, char *argv[]) {
     if (bitcoin_init() != 0) return 1;
     if (stratum_start_thread() != 0) return 1;
 
-    // Start ZMQ listener (Safe updates)
+    // 1. Start ZMQ (Updates template reliably but with latency)
     zmq_listener_start();
-
-    // [NEW] Start P2P listener (Fast updates)
-    p2p_start_thread(g_config.p2p_host, g_config.p2p_port, g_config.p2p_magic);
     
+    // 2. Start Web
     web_server_start(8080); 
 
-    log_info("Gateway ready on port %d. Monitoring P2P: %s:%d", 
-             g_config.stratum_port, g_config.p2p_host, g_config.p2p_port);
+    log_info("Gateway ready on port %d.", g_config.stratum_port);
 
+    // 3. First RPC Sync (Get initial block template & Height)
+    log_info("Performing initial RPC sync...");
     bitcoin_update_template(true);
     time_t last_check = time(NULL);
+
+    // 4. Get Current Height for P2P Handshake
+    uint32_t current_height = 0;
+    bitcoin_get_telemetry(&current_height, NULL, NULL);
+    if (current_height == 0) {
+        log_error("Warning: Initial RPC failed, P2P will start with height 0 (Slow push)");
+    }
+
+    // 5. Start P2P Listener (Now that we know the height)
+    log_info("Starting P2P with initial height: %d", current_height);
+    p2p_start_thread(g_config.p2p_host, g_config.p2p_port, g_config.p2p_magic, (int32_t)current_height);
 
     while (1) {
         if (g_block_notify) {

@@ -25,11 +25,10 @@ static pthread_mutex_t g_tmpl_lock = PTHREAD_MUTEX_INITIALIZER;
 
 // ---------- helpers ----------
 
-// Helper: Calculate block subsidy (halving logic)
 static int64_t calc_subsidy(int height) {
     int halvings = height / 210000;
     if (halvings >= 64) return 0;
-    int64_t subsidy = 5000000000LL; // 50 BTC start
+    int64_t subsidy = 5000000000LL; 
     return subsidy >> halvings;
 }
 
@@ -44,7 +43,7 @@ static int cmp256_be(const uint8_t a[32], const uint8_t b[32]) {
 static void nbits_to_target_be(uint32_t nbits, uint8_t target_be[32]) {
     memset(target_be, 0, 32);
     uint32_t exp = nbits >> 24;
-    uint32_t mant = nbits & 0x007fffffU; // ignore sign bit
+    uint32_t mant = nbits & 0x007fffffU; 
     if (exp == 0) return;
 
     if (exp <= 3) {
@@ -144,14 +143,14 @@ static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, voi
     return realsize;
 }
 
-// [优化 1] 使用 Thread Local Storage 复用 CURL 句柄，保持长连接 (Keep-Alive)
+// [OPTIMIZATION 1] Thread Local CURL for Keep-Alive
 static json_t* rpc_call(const char *method, json_t *params) {
     static __thread CURL *curl = NULL;
 
     if (curl == NULL) {
         curl = curl_easy_init();
     } else {
-        curl_easy_reset(curl); // 重置状态，复用连接
+        curl_easy_reset(curl); 
     }
 
     if (!curl) { log_error("Init CURL failed"); return NULL; }
@@ -160,7 +159,6 @@ static json_t* rpc_call(const char *method, json_t *params) {
     chunk.memory = malloc(1);
     chunk.size = 0;
     if (!chunk.memory) { 
-        // 句柄保留给下次使用，不 cleanup
         return NULL; 
     }
 
@@ -175,7 +173,7 @@ static json_t* rpc_call(const char *method, json_t *params) {
 
     struct curl_slist *headers = NULL;
     headers = curl_slist_append(headers, "content-type: text/plain;");
-    headers = curl_slist_append(headers, "Connection: keep-alive"); // 显式请求 Keep-Alive
+    headers = curl_slist_append(headers, "Connection: keep-alive");
 
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_URL, g_config.rpc_url);
@@ -186,15 +184,10 @@ static json_t* rpc_call(const char *method, json_t *params) {
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
-    // 允许重用连接
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
 
     CURLcode res = curl_easy_perform(curl);
     
-    // 移除 curl_easy_getinfo 检查 HTTP code 的冗余步骤，直接看结果
-    // long http_code = 0;
-    // curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-
     json_t *response = NULL;
     if (res == CURLE_OK && chunk.memory) {
         json_error_t err;
@@ -211,8 +204,28 @@ static json_t* rpc_call(const char *method, json_t *params) {
     curl_slist_free_all(headers);
     json_decref(req);
     
-    // [重要] 不要 curl_easy_cleanup(curl)，让句柄随线程存活
+    // Do not cleanup curl to allow keep-alive
     return response;
+}
+
+// [NEW] RPC Header Bridge for P2P Remote Node
+static void rpc_submit_header_bridge(const uint8_t *header_bytes) {
+    if (!header_bytes) return;
+
+    char hex_header[161];
+    bin2hex_safe(header_bytes, 80, hex_header, sizeof(hex_header));
+
+    json_t *params = json_array();
+    json_array_append_new(params, json_string(hex_header));
+
+    // Fire and forget (sync call but fast due to keep-alive)
+    json_t *resp = rpc_call("submitheader", params);
+    
+    if (resp) {
+        json_decref(resp);
+    } else {
+        log_error("Bridge: Failed to push header to local node!");
+    }
 }
 
 // ---------- job memory ----------
@@ -310,7 +323,7 @@ static bool build_coinbase_variant(uint32_t height, int64_t value_sats,
     if (extranonce1_size <= 0 || extranonce2_size <= 0) return false;
 
     // --- ScriptSig Construction ---
-    uint8_t scriptSig[256];   // Control max length
+    uint8_t scriptSig[256];   
     size_t sp = 0;
 
     // 1. BIP34 Height
@@ -327,9 +340,9 @@ static bool build_coinbase_variant(uint32_t height, int64_t value_sats,
     if (w1 == 0) return false;
     sp += w1;
 
-    // 2. ExtraNonce PUSHDATA (ex1+ex2 occupy one continuous block)
+    // 2. ExtraNonce PUSHDATA
     size_t en_tot = (size_t)(extranonce1_size + extranonce2_size);
-    if (en_tot == 0 || en_tot > 252) return false; // Defense
+    if (en_tot == 0 || en_tot > 252) return false;
     if (sizeof(scriptSig) < sp + 3 + en_tot) return false;
 
     if (en_tot <= 75) {
@@ -344,11 +357,11 @@ static bool build_coinbase_variant(uint32_t height, int64_t value_sats,
     }
 
     size_t split_point_1 = sp; 
-    memset(scriptSig + sp, 0, en_tot); // Placeholder for ex1+ex2
+    memset(scriptSig + sp, 0, en_tot);
     sp += en_tot;
     size_t split_point_2 = sp;
 
-    // 3. Variant Specific Tag (Control length)
+    // 3. Variant Tag
     const char *tag = g_config.coinbase_tag;
     if (tag && tag[0]) {
         uint8_t tagbuf[64];
@@ -367,14 +380,14 @@ static bool build_coinbase_variant(uint32_t height, int64_t value_sats,
         if (w_tag > 0) sp += w_tag;
     }
 
-    // --- Coinb1: TX prefix + scriptSig first part (up to split_point_1) ---
+    // --- Coinb1 ---
     uint8_t tx_prefix[64];
     size_t tp = 0;
-    put_le32(tx_prefix + tp, 1); tp += 4;          // version
-    tx_prefix[tp++] = 0x01;                        // vin count
-    memset(tx_prefix + tp, 0, 32); tp += 32;       // prevhash (0)
-    put_le32(tx_prefix + tp, 0xffffffffU); tp += 4;// index
-    tp += encode_varint(tx_prefix + tp, (uint64_t)sp); // Total ScriptSig Len
+    put_le32(tx_prefix + tp, 1); tp += 4;          
+    tx_prefix[tp++] = 0x01;                        
+    memset(tx_prefix + tp, 0, 32); tp += 32;       
+    put_le32(tx_prefix + tp, 0xffffffffU); tp += 4;
+    tp += encode_varint(tx_prefix + tp, (uint64_t)sp); 
 
     uint8_t coinb1_bin[512];
     if (sizeof(coinb1_bin) < tp + split_point_1) return false;
@@ -383,12 +396,12 @@ static bool build_coinbase_variant(uint32_t height, int64_t value_sats,
     memcpy(coinb1_bin + c1, tx_prefix, tp); c1 += tp;
     memcpy(coinb1_bin + c1, scriptSig, split_point_1); c1 += split_point_1;
 
-    // --- Coinb2: scriptSig second part + outputs + locktime ---
+    // --- Coinb2 ---
     uint8_t coinb2_bin[1024];
     size_t c2 = 0;
     memcpy(coinb2_bin + c2, scriptSig + split_point_2, sp - split_point_2); 
     c2 += (sp - split_point_2);
-    put_le32(coinb2_bin + c2, 0xffffffffU); c2 += 4; // sequence
+    put_le32(coinb2_bin + c2, 0xffffffffU); c2 += 4; 
 
     // Outputs
     int outputs = 1;
@@ -409,7 +422,7 @@ static bool build_coinbase_variant(uint32_t height, int64_t value_sats,
 
     // Output 2: Witness Commitment
     if (has_wit_commit) {
-        put_le64(coinb2_bin + c2, 0); c2 += 8; // value 0
+        put_le64(coinb2_bin + c2, 0); c2 += 8;
         size_t wlen = strlen(default_witness_commitment_hex) / 2;
         coinb2_bin[c2++] = (uint8_t)wlen;
         uint8_t wbin[128];
@@ -431,17 +444,14 @@ static bool calculate_merkle_branch_standard(const uint8_t (*txids_le)[32],
     *out_branch = NULL; 
     *out_count = 0;
     
-    // If only coinbase (tx_count=0), branch is empty
     if (tx_count == 0) return true;
 
-    size_t leaf_count = tx_count + 1; // coinbase + txs
+    size_t leaf_count = tx_count + 1;
     uint8_t *level = calloc(leaf_count, 32);
     if (!level) return false;
 
-    // level[0] is coinbase, placeholder 0 (content doesn't affect sibling path logic)
     memset(level, 0, 32);
     
-    // level[1..] filled with txids_le
     for (size_t i = 0; i < tx_count; i++) {
         memcpy(level + (i + 1) * 32, txids_le[i], 32);
     }
@@ -450,16 +460,15 @@ static bool calculate_merkle_branch_standard(const uint8_t (*txids_le)[32],
     if (!branch) { free(level); return false; }
 
     size_t branch_len = 0;
-    size_t idx = 0;          // coinbase index
+    size_t idx = 0;          
     size_t curr_count = leaf_count;
 
     while (curr_count > 1) {
         size_t sibling_idx = (idx ^ 1);
         if (sibling_idx >= curr_count) {
-            sibling_idx = idx;  // odd count, last one hashes with itself
+            sibling_idx = idx;  
         }
 
-        // Record sibling (LE -> LE hex)
         const uint8_t *sib = level + sibling_idx * 32;
         char hex[65];
         bin2hex_safe(sib, 32, hex, sizeof(hex));
@@ -473,7 +482,6 @@ static bool calculate_merkle_branch_standard(const uint8_t (*txids_le)[32],
         }
         branch_len++;
 
-        // Calc next level
         size_t next_count = (curr_count + 1) / 2;
         uint8_t *next_level = calloc(next_count, 32);
         if (!next_level) {
@@ -498,7 +506,7 @@ static bool calculate_merkle_branch_standard(const uint8_t (*txids_le)[32],
         free(level);
         level = next_level;
         curr_count = next_count;
-        idx >>= 1;  // Parent index
+        idx >>= 1; 
     }
     
     free(level);
@@ -521,11 +529,16 @@ static int bitcoin_submit_block(const char *hex_data) {
     return success;
 }
 
-// [NEW] P2P Fast Block Switch
+// [P2P Entry Point]
 void bitcoin_fast_new_block(const uint8_t *header_80_bytes) {
+    // [ECO MODE] Exit if no miners
+    if (stratum_get_client_count() == 0) return;
+
     if (!header_80_bytes) return;
 
-    // 1. Calculate new block hash (which is our new PrevHash)
+    // [BRIDGE] Push header to local node immediately
+    rpc_submit_header_bridge(header_80_bytes);
+
     uint8_t new_hash[32];
     sha256_double(header_80_bytes, 80, new_hash);
 
@@ -537,64 +550,47 @@ void bitcoin_fast_new_block(const uint8_t *header_80_bytes) {
         return;
     }
 
-    // 2. Anti-Replay: If we are already mining on this hash, ignore
     if (memcmp(curr->prevhash_le, new_hash, 32) == 0) {
         pthread_mutex_unlock(&g_tmpl_lock);
         return;
     }
 
-    // 3. Switch if incoming PrevHash != Current Job PrevHash
-    // This implies a new block on the network.
-    uint8_t incoming_prev[32];
-    memcpy(incoming_prev, header_80_bytes + 4, 32);
-
     log_info("⚡ P2P Signal: New Block Detected!");
 
-    // --- Build Empty Block Job ---
     int next_head = (g_job_head + 1) % MAX_JOB_HISTORY;
     Template *next = &g_jobs[next_head];
     bitcoin_free_job(next);
 
-    // Copy basics from current job (assume rules haven't changed in 1 block)
     *next = *curr;
     next->merkle_branch = NULL;
     next->tx_hexs = NULL;
     next->txids_le = NULL;
-    next->tx_count = 0; // EMPTY BLOCK
-    next->has_segwit = false; // No segwit commitment needed for empty block
+    next->tx_count = 0; 
+    next->has_segwit = false; 
 
-    // Set new PrevHash
     memcpy(next->prevhash_le, new_hash, 32);
     
-    // Swap for Stratum
     uint8_t tmp_swap[32];
     memcpy(tmp_swap, new_hash, 32);
     swap32_buffer(tmp_swap, 32);
     bin2hex_safe(tmp_swap, 32, next->prev_hash_stratum, sizeof(next->prev_hash_stratum));
 
-    // [优化] 使用本地 GBT 的 version 和 nbits，避免脏版本号
     next->version_val = curr->version_val;
     next->nbits_val = curr->nbits_val;
-    // 重新生成 Hex 字符串 (确保格式一致)
     snprintf(next->version_hex, 9, "%08x", next->version_val);
     snprintf(next->nbits_hex, 9, "%08x", next->nbits_val);
 
-    // Increase Height
     next->height = curr->height + 1;
     
-    // Reset Time
     next->curtime_val = (uint32_t)time(NULL);
     snprintf(next->ntime_hex, 9, "%08x", next->curtime_val);
 
-    // Generate Fast Job ID
     static int fast_cnt = 0;
     snprintf(next->job_id, sizeof(next->job_id), "FAST%x", ++fast_cnt);
-    next->clean_jobs = true; // FORCE SWITCH
+    next->clean_jobs = true; 
 
-    // Recalculate Reward (Subsidy Only, No Fees)
     next->coinbase_value = calc_subsidy(next->height);
 
-    // Rebuild Coinbase
     bool build_ok = true;
     for (int v = 0; v < MAX_COINBASE_VARIANTS; v++) {
         if (!build_coinbase_variant(next->height, next->coinbase_value, 
@@ -612,11 +608,9 @@ void bitcoin_fast_new_block(const uint8_t *header_80_bytes) {
         return;
     }
 
-    // Merkle Root for Empty Block is just the Coinbase Hash
     next->merkle_count = 0;
     next->merkle_branch = NULL; 
 
-    // Commit
     g_job_head = next_head;
     Template notify = *next;
     
@@ -626,7 +620,7 @@ void bitcoin_fast_new_block(const uint8_t *header_80_bytes) {
     stratum_broadcast_job(&notify);
 }
 
-// [优化 2] 零内存分配验证 (Zero-Malloc Validation)
+// [OPTIMIZATION 2] Zero-Malloc Share Validation
 int bitcoin_validate_and_submit(const char *job_id,
                                 const char *full_extranonce_hex,
                                 const char *ntime_hex,
@@ -647,13 +641,8 @@ int bitcoin_validate_and_submit(const char *job_id,
     int valid_variant = -1;
     uint8_t root_le[32];
     
-    // 使用栈内存 buffer (8KB足够)，避免 malloc/free 带来的碎片和开销
+    // Stack buffer instead of malloc
     uint8_t coin_buffer[8192]; 
-
-    // 记录成功验证的 coinbase 以备爆块时使用
-    uint8_t *final_coin_bin = NULL;
-    size_t final_coin_len = 0;
-    // 注意：coin_hex 仅在 submitblock (极低频) 时生成，不需要在热路径优化
 
     for (int v = 0; v < MAX_COINBASE_VARIANTS; v++) {
         size_t c1_len = strlen(job->coinb1[v]) / 2;
@@ -663,7 +652,6 @@ int bitcoin_validate_and_submit(const char *job_id,
         
         if (total_len > sizeof(coin_buffer)) continue;
         
-        // 直接在栈上拼接二进制数据，跳过 Hex String 拼接步骤
         size_t offset = 0;
         hex2bin_checked(job->coinb1[v], coin_buffer + offset, c1_len); offset += c1_len;
         hex2bin_checked(full_extranonce_hex, coin_buffer + offset, ex_len); offset += ex_len;
@@ -672,11 +660,9 @@ int bitcoin_validate_and_submit(const char *job_id,
         uint8_t cb_txid[32];
         sha256d(coin_buffer, offset, cb_txid);
         
-        // Calculate Merkle Root
         uint8_t curr_root[32];
         memcpy(curr_root, cb_txid, 32);
         
-        // Loop is skipped if merkle_count == 0 (empty block case)
         for (size_t k = 0; k < job->merkle_count; k++) {
             uint8_t sib_le[32];
             hex2bin_checked(job->merkle_branch[k], sib_le, 32);
@@ -687,7 +673,6 @@ int bitcoin_validate_and_submit(const char *job_id,
             sha256d(cat, 64, curr_root);
         }
         
-        // Construct header
         uint8_t head[80];
         uint32_t ver = job->version_val;
         if (g_config.version_mask != 0) ver = (ver & ~g_config.version_mask) | (version_bits & g_config.version_mask);
@@ -702,7 +687,6 @@ int bitcoin_validate_and_submit(const char *job_id,
         uint8_t hash_le[32]; sha256d(head, 80, hash_le);
         uint8_t hash_be[32]; for(int i=0;i<32;i++) hash_be[i] = hash_le[31-i];
         
-        // Calculate diff
         double d = 0.0;
         for (int i = 0; i < 32; i++) d = d * 256.0 + hash_be[i];
         if (d < 1.0) d = 1.0;
@@ -716,10 +700,6 @@ int bitcoin_validate_and_submit(const char *job_id,
             valid_variant = v;
             memcpy(root_le, curr_root, 32);
             if (share_diff) *share_diff = s_diff;
-            
-            // 只有验证通过，且需要爆块时，我们才考虑保存 coinbase 数据
-            // 由于栈内存会在循环后失效，这里暂时不需要 copy，除非是 is_block
-            // 这里我们只需要知道验证通过了
             break; 
         }
     }
@@ -729,13 +709,10 @@ int bitcoin_validate_and_submit(const char *job_id,
         return 0; // Rejected
     }
 
-    // Check if block
     uint8_t block_target_be[32];
     nbits_to_target_be(job->nbits_val, block_target_be);
     
-    // Quick re-calc header hash for block check (reusing head from loop might be tricky if loop broke early, safe to recalc)
-    // Actually we can reuse `head` if we ensure it matches the `valid_variant` break. 
-    // Re-doing setup is cheap compared to mallocs.
+    // Quick re-calc header hash
     uint8_t head[80];
     uint32_t ver = job->version_val;
     if (g_config.version_mask != 0) ver = (ver & ~g_config.version_mask) | (version_bits & g_config.version_mask);
@@ -754,24 +731,19 @@ int bitcoin_validate_and_submit(const char *job_id,
     if (is_block) {
         log_info(">>> BLOCK FOUND! Hash via Variant %d", valid_variant);
         
-        // 只有在爆块时才进行堆内存分配，这是极低频事件，安全
         size_t cap = 10 * 1024 * 1024;
         char *block_hex = malloc(cap);
         
-        // 重新构建二进制 Coinbase (因为之前栈内存中的数据可能已覆盖)
-        // 这里的开销相对于爆块收益可以忽略不计
         size_t c1_len = strlen(job->coinb1[valid_variant]) / 2;
         size_t ex_len = strlen(full_extranonce_hex) / 2;
         size_t c2_len = strlen(job->coinb2[valid_variant]) / 2;
         size_t coin_total = c1_len + ex_len + c2_len;
         
-        // 使用栈 buffer 再次拼接 (安全)
         uint8_t *coin_ptr = coin_buffer;
         hex2bin_checked(job->coinb1[valid_variant], coin_ptr, c1_len); 
         hex2bin_checked(full_extranonce_hex, coin_ptr + c1_len, ex_len);
         hex2bin_checked(job->coinb2[valid_variant], coin_ptr + c1_len + ex_len, c2_len);
 
-        // 生成 coinbase hex string (部分代码需要)
         char *coin_hex_str = malloc(coin_total * 2 + 1);
         bin2hex_safe(coin_ptr, coin_total, coin_hex_str, coin_total * 2 + 1);
 
@@ -786,70 +758,22 @@ int bitcoin_validate_and_submit(const char *job_id,
             memcpy(block_hex + pos, vi_hex, strlen(vi_hex)); pos += strlen(vi_hex);
 
             if (job->has_segwit) {
-                 // Coinbase tx with witness
-                 // Need to reconstruct segwit structure manually or assume standard format
-                 // For simplified logic, assume coin_ptr contains the raw tx
-                 // But wait, our coinb1/coinb2 construction ALREADY includes the TX structure (version, vin, vout, locktime)
-                 // Segwit items (witness) are usually appended at the end or marked.
-                 // Actually, standard GBT coinb1/coinb2 creates a LEGACY tx structure in terms of serialization 
-                 // unless we insert witness markers.
-                 // If `has_segwit` is true, we must serialize in Witness format:
-                 // [Header][TxCount][Coinbase(Witness)][Tx1..N]
-                 
-                 // However, reconstructing the full witness serialization from just coinb1/coinb2 is tricky 
-                 // if not handled by `build_coinbase_variant`.
-                 // Your existing code had logic for this. Let's adapt it to use our binary buffer.
-                 
-                 // Original logic used coin_bin (the full tx).
-                 // Segwit Tx Serialization: [Version][Marker][Flag][Inputs][Outputs][Witness][Locktime]
-                 // But coinb1/coinb2 usually provides [Version][Inputs]...[Outputs][Locktime].
-                 // It does NOT include Marker/Flag if built via standard GBT parts unless explicitly added.
-                 // But wait, `build_coinbase_variant` builds the transaction. 
-                 // If it's segwit, the witness commitment is in output, but the Marker/Flag (0001) needs to be inserted?
-                 // The original code:
-                 // memcpy(block_hex + pos, part, 8); // Version
-                 // memcpy(block_hex + pos, "0001", 4); // Marker Flag
-                 // ... body ...
-                 // ... witness ...
-                 
-                 // Let's replicate original logic using our coin_ptr
                  char part[128];
                  bin2hex_safe(coin_ptr, 4, part, sizeof(part)); // Version
                  memcpy(block_hex + pos, part, 8); pos += 8;
                  memcpy(block_hex + pos, "0001", 4); pos += 4;
                  
-                 size_t body_len = coin_total - 8; // Subtract version(4) and locktime(4)? No, just Version.
-                 // Original code assumed coin_bin len - 8? 
-                 // Actually, original: `size_t body_len = coin_bin_len - 8;` -> wait, locktime is at end.
-                 // Original code: `bin2hex_safe(coin_bin + 4, body_len, body_hex, ...)`
-                 // It takes everything from offset 4 to end-4.
-                 // It strips Version (first 4) and Locktime (last 4)? No, `coin_bin_len - 8` removes 8 bytes total?
-                 // Let's assume original logic was correct for the specific GBT format.
-                 // Replicating:
-                 
-                 char *body_hex = malloc(coin_total * 2 + 1); // rough alloc
-                 // From offset 4, length = coin_total - 4 (keep locktime? or witness is inserted before locktime?)
-                 // Witness data is appended at the very end of TX for Segwit.
-                 // So: [Version][Marker][Flag][Inputs][Outputs][Witness][Locktime]
-                 // Our coin_ptr is [Version][Inputs][Outputs][Locktime]
-                 
-                 // 1. Version (4 bytes) - Already added
-                 // 2. Marker/Flag - Already added
-                 // 3. Body: Inputs + Outputs. 
-                 //    Length = Total - Version(4) - Locktime(4).
                  size_t mid_len = coin_total - 8;
+                 char *body_hex = malloc(mid_len * 2 + 1);
                  bin2hex_safe(coin_ptr + 4, mid_len, body_hex, mid_len * 2 + 1);
                  memcpy(block_hex + pos, body_hex, strlen(body_hex)); pos += strlen(body_hex);
                  free(body_hex);
 
-                 // 4. Witness: Coinbase witness is usually: 01 20 00...00 (32 bytes 00)
                  memcpy(block_hex + pos, "01200000000000000000000000000000000000000000000000000000000000000000", 68); pos += 68;
                  
-                 // 5. Locktime (Last 4 bytes)
                  bin2hex_safe(coin_ptr + coin_total - 4, 4, part, sizeof(part));
                  memcpy(block_hex + pos, part, 8); pos += 8;
             } else {
-                 // Legacy: Just dump the hex
                  memcpy(block_hex + pos, coin_hex_str, strlen(coin_hex_str)); pos += strlen(coin_hex_str);
             }
 
@@ -870,6 +794,9 @@ int bitcoin_validate_and_submit(const char *job_id,
 }
 
 void bitcoin_update_template(bool force_clean) {
+    // [ECO MODE] Skip if no miners (unless forced wake-up)
+    if (!force_clean && stratum_get_client_count() == 0) return;
+
     json_t *rules = json_array();
     json_array_append_new(rules, json_string("segwit"));
     json_array_append_new(rules, json_string("csv"));
@@ -942,7 +869,7 @@ void bitcoin_update_template(bool force_clean) {
 
     for (int v = 0; v < MAX_COINBASE_VARIANTS; v++) {
         if (!build_coinbase_variant(tmp.height, tmp.coinbase_value, 
-                                    v, // variant index
+                                    v, 
                                     tmp.has_segwit, dwc,
                                     4, g_config.extranonce2_size,
                                     tmp.coinb1[v], sizeof(tmp.coinb1[v]),

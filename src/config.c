@@ -56,12 +56,18 @@ int load_config(const char *filename) {
     safe_read_string(root, "rpc_pass", g_config.rpc_pass, sizeof(g_config.rpc_pass));
     safe_read_string(root, "zmq_pub_hashblock", g_config.zmq_addr, sizeof(g_config.zmq_addr));
     
-    // [NEW] P2P Config Loader
+    // P2P - Fast Node (Primary)
     safe_read_string(root, "p2p_host", g_config.p2p_host, sizeof(g_config.p2p_host));
-    if (strlen(g_config.p2p_host) == 0) strcpy(g_config.p2p_host, "127.0.0.1"); // Default
+    if (strlen(g_config.p2p_host) == 0) strcpy(g_config.p2p_host, "127.0.0.1");
     
     json_t *p2p_p = json_object_get(root, "p2p_port");
     g_config.p2p_port = (p2p_p && json_is_integer(p2p_p)) ? (int)json_integer_value(p2p_p) : 8333;
+
+    // [NEW] P2P - Local Node (Secondary)
+    safe_read_string(root, "local_p2p_host", g_config.local_p2p_host, sizeof(g_config.local_p2p_host));
+    
+    json_t *lp2p_p = json_object_get(root, "local_p2p_port");
+    g_config.local_p2p_port = (lp2p_p && json_is_integer(lp2p_p)) ? (int)json_integer_value(lp2p_p) : 8333;
 
     json_t *p2p_m = json_object_get(root, "p2p_magic");
     if (p2p_m && json_is_string(p2p_m)) {

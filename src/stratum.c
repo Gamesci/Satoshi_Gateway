@@ -39,674 +39,347 @@ static time_t g_last_history_update = 0;
 // --- Stats Helpers ---
 static void record_share(const char *ex1, double diff, const char *hash, bool is_block) {
     pthread_mutex_lock(&g_stats_lock);
-    int idx = g_share_log_head;
-    strncpy(g_share_logs[idx].worker_ex1, ex1, 8);
-    g_share_logs[idx].worker_ex1[8] = 0;
-    g_share_logs[idx].difficulty = diff;
-    strncpy(g_share_logs[idx].share_hash, hash, 64);
-    g_share_logs[idx].share_hash[64] = 0;
-    g_share_logs[idx].timestamp = time(NULL);
-    g_share_logs[idx].is_block = is_block;
+    ShareLog *log = &g_share_logs[g_share_log_head];
+    strncpy(log->worker_ex1, ex1, sizeof(log->worker_ex1)-1);
+    log->difficulty = diff;
+    strncpy(log->share_hash, hash, sizeof(log->share_hash)-1);
+    log->timestamp = time(NULL);
+    log->is_block = is_block;
     
     g_share_log_head = (g_share_log_head + 1) % MAX_SHARE_LOGS;
     pthread_mutex_unlock(&g_stats_lock);
 }
 
-static void update_global_hashrate_history(double total_hashrate) {
-    time_t now = time(NULL);
-    pthread_mutex_lock(&g_stats_lock);
-    if (g_last_history_update == 0) g_last_history_update = now;
-    
-    if (now - g_last_history_update >= 60) {
-        for (int i = 0; i < HISTORY_POINTS - 1; i++) {
-            g_hashrate_history[i] = g_hashrate_history[i+1];
-        }
-        g_hashrate_history[HISTORY_POINTS - 1] = total_hashrate;
-        g_last_history_update = now;
-    } else {
-        g_hashrate_history[HISTORY_POINTS - 1] = total_hashrate;
-    }
-    pthread_mutex_unlock(&g_stats_lock);
-}
-
-// --- Stratum Logic ---
-static uint64_t fnv1a64(const void *data, size_t len) {
-    const uint8_t *p = (const uint8_t*)data;
-    uint64_t h = 1469598103934665603ULL;
-    for (size_t i = 0; i < len; i++) {
-        h ^= p[i];
-        h *= 1099511628211ULL;
-    }
-    return h;
-}
-
-static bool is_duplicate_share_fp(uint64_t fp) {
-    pthread_mutex_lock(&g_cache_lock);
-    for (int i = 0; i < SHARE_CACHE_SIZE; i++) {
-        if (g_share_cache[i] == fp) {
-            pthread_mutex_unlock(&g_cache_lock);
-            return true;
+// [NEW] Helper: Get active miner count
+int stratum_get_client_count(void) {
+    int count = 0;
+    pthread_mutex_lock(&g_clients_lock);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (g_clients[i].active && g_clients[i].is_authorized) {
+            count++;
         }
     }
-    g_share_cache[g_share_head] = fp;
-    g_share_head = (g_share_head + 1) % SHARE_CACHE_SIZE;
-    pthread_mutex_unlock(&g_cache_lock);
-    return false;
+    pthread_mutex_unlock(&g_clients_lock);
+    return count;
 }
 
 static void init_clients(void) {
     for (int i = 0; i < MAX_CLIENTS; i++) {
         g_clients[i].active = false;
-        g_clients[i].sock = -1;
         g_clients[i].is_authorized = false;
-        g_clients[i].last_job_id[0] = '\0';
     }
-}
-
-static Client* client_add(int sock, struct sockaddr_in addr) {
-    struct timeval tv;
-    tv.tv_sec = 2; 
-    tv.tv_usec = 0;
-    if (setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv)) < 0) {
-        log_error("Failed to set SO_SNDTIMEO on client socket");
-    }
-
-    tv.tv_sec = 30; 
-    tv.tv_usec = 0;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
-
-    pthread_mutex_lock(&g_clients_lock);
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (!g_clients[i].active) {
-            Client *c = &g_clients[i];
-            c->active = true;
-            c->sock = sock;
-            c->addr = addr;
-            c->id = i + 1;
-            c->is_authorized = false;
-
-            c->current_diff = (double)g_config.initial_diff;
-            c->previous_diff = 0.0;
-            c->last_retarget_time = time(NULL);
-            c->shares_in_window = 0;
-            
-            c->hashrate_est = 0.0;
-            c->last_submit_time = time(NULL);
-            c->total_shares = 0;
-            c->best_diff = 0.0;
-            
-            c->coinbase_variant = CB_VARIANT_DEFAULT;
-            c->user_agent[0] = '\0';
-
-            snprintf(c->extranonce1_hex, sizeof(c->extranonce1_hex), "%08x", (uint32_t)c->id);
-            c->last_job_id[0] = '\0';
-
-            pthread_mutex_unlock(&g_clients_lock);
-            return c;
-        }
-    }
-    pthread_mutex_unlock(&g_clients_lock);
-    return NULL;
 }
 
 static void client_remove(Client *c) {
-    if (!c) return;
     pthread_mutex_lock(&g_clients_lock);
     if (c->active) {
         close(c->sock);
         c->active = false;
-        c->sock = -1;
         c->is_authorized = false;
-        c->last_job_id[0] = '\0';
         log_info("Client %d disconnected", c->id);
     }
     pthread_mutex_unlock(&g_clients_lock);
 }
 
-static void send_json(int sock, json_t *response) {
-    char *s = json_dumps(response, JSON_COMPACT);
-    if (!s) return;
-    size_t l = strlen(s);
-    char *m = malloc(l + 2);
-    if (!m) { free(s); return; }
-    memcpy(m, s, l);
-    m[l] = '\n';
-    m[l + 1] = '\0';
+static bool check_duplicate_share(uint64_t nonce_val, const char *extranonce2_hex, uint32_t ntime_val) {
+    // Simple deduplication using a hash of (nonce ^ extra2_first_8_bytes ^ ntime)
+    // Production systems need better deduplication.
+    uint64_t ex2_low = 0;
+    if (extranonce2_hex) {
+        // Just take first 8 bytes or less
+        ex2_low = strtoull(extranonce2_hex, NULL, 16);
+    }
+    uint64_t key = nonce_val ^ ex2_low ^ (uint64_t)ntime_val;
     
-    ssize_t sent = send(sock, m, l + 1, MSG_NOSIGNAL);
-    if (sent < 0) {}
+    pthread_mutex_lock(&g_cache_lock);
+    for (int i = 0; i < SHARE_CACHE_SIZE; i++) {
+        if (g_share_cache[i] == key) {
+            pthread_mutex_unlock(&g_cache_lock);
+            return true;
+        }
+    }
+    g_share_cache[g_share_head] = key;
+    g_share_head = (g_share_head + 1) % SHARE_CACHE_SIZE;
+    pthread_mutex_unlock(&g_cache_lock);
+    return false;
+}
 
-    free(m);
+static void send_line(int sock, const char *line) {
+    send(sock, line, strlen(line), 0);
+    send(sock, "\n", 1, 0);
+}
+
+static void send_result_bool(int sock, json_t *id, bool res) {
+    json_t *resp = json_object();
+    json_object_set_new(resp, "id", json_incref(id));
+    json_object_set_new(resp, "result", json_boolean(res));
+    json_object_set_new(resp, "error", json_null());
+    char *s = json_dumps(resp, 0);
+    send_line(sock, s);
     free(s);
+    json_decref(resp);
 }
 
-static void send_difficulty(Client *c, double diff) {
-    json_t *res = json_object();
-    json_object_set_new(res, "id", json_null());
-    json_object_set_new(res, "method", json_string("mining.set_difficulty"));
-    json_t *params = json_array();
-    json_array_append_new(params, json_real(diff));
-    json_object_set_new(res, "params", params);
-    send_json(c->sock, res);
-    json_decref(res);
+static void send_reply_true(int sock, json_t *id) {
+    send_result_bool(sock, id, true);
 }
 
-// >>>>> VarDiff 逻辑 <<<<<
-static void vardiff_check(Client *c) {
-    time_t now = time(NULL);
-    double dt = difftime(now, c->last_retarget_time);
+static void send_error(int sock, json_t *id, int code, const char *msg) {
+    json_t *resp = json_object();
+    json_object_set_new(resp, "id", json_incref(id));
+    json_object_set_new(resp, "result", json_null());
+    json_t *err = json_array();
+    json_array_append_new(err, json_integer(code));
+    json_array_append_new(err, json_string(msg));
+    json_array_append_new(err, json_null());
+    json_object_set_new(resp, "error", err);
+    char *s = json_dumps(resp, 0);
+    send_line(sock, s);
+    free(s);
+    json_decref(resp);
+}
+
+static void handle_subscribe(Client *c, json_t *id, json_t *params) {
+    // params: [userAgent, extraNonce1_optional]
+    // Ignore params for simplicity, generate Extranonce1
+    // Format: Configurable ID ? No, let's just use client ID hex
+    snprintf(c->extranonce1_hex, sizeof(c->extranonce1_hex), "%08x", c->id);
     
-    if (dt < 60.0) return;
-
-    double spm = (c->shares_in_window / dt) * 60.0;
-    double target = (double)g_config.vardiff_target;
-    double new_diff = c->current_diff;
-    bool changed = false;
-    bool emergency_drop = (c->shares_in_window == 0); 
-
-    if (spm < target * 0.4) {
-        if (emergency_drop) new_diff /= 2.0;
-        else new_diff /= 1.2;
-        changed = true;
-    } 
-    else if (spm > target * 1.5) {
-        new_diff *= 1.2;
-        changed = true;
+    // Check if user agent hints at variant
+    c->coinbase_variant = CB_VARIANT_DEFAULT;
+    if (json_array_size(params) > 0) {
+        const char *ua = json_string_value(json_array_get(params, 0));
+        if (ua) {
+            strncpy(c->user_agent, ua, sizeof(c->user_agent)-1);
+            if (strstr(ua, "NiceHash")) c->coinbase_variant = CB_VARIANT_NICEHASH;
+            else if (strstr(ua, "WhatsMiner")) c->coinbase_variant = CB_VARIANT_WHATSMINER;
+        }
     }
 
-    if (new_diff < g_config.vardiff_min_diff) new_diff = g_config.vardiff_min_diff;
-    double max_d = (g_config.vardiff_max_diff > 0) ? g_config.vardiff_max_diff : 1.0e15;
-    if (new_diff > max_d) new_diff = max_d;
+    json_t *resp = json_object();
+    json_object_set_new(resp, "id", json_incref(id));
+    json_object_set_new(resp, "error", json_null());
+    
+    json_t *res_arr = json_array();
+    
+    json_t *subs = json_array();
+    json_t *sub1 = json_array();
+    json_array_append_new(sub1, json_string("mining.set_difficulty"));
+    json_array_append_new(sub1, json_string("1")); // subscription id
+    json_array_append_new(subs, sub1);
+    json_t *sub2 = json_array();
+    json_array_append_new(sub2, json_string("mining.notify"));
+    json_array_append_new(sub2, json_string("1"));
+    json_array_append_new(subs, sub2);
+    
+    json_array_append_new(res_arr, subs);
+    json_array_append_new(res_arr, json_string(c->extranonce1_hex));
+    json_array_append_new(res_arr, json_integer(g_config.extranonce2_size));
+    
+    json_object_set_new(resp, "result", res_arr);
+    
+    char *s = json_dumps(resp, 0);
+    send_line(c->sock, s);
+    free(s);
+    json_decref(resp);
+}
 
-    if (changed && new_diff != c->current_diff) {
-        log_info("VarDiff ID=%d: %.0f -> %.0f (SPM: %.2f, Shares: %d)", 
-                 c->id, c->current_diff, new_diff, spm, c->shares_in_window);
+static void handle_authorize(Client *c, json_t *id, json_t *params) {
+    // Accept any user/pass
+    c->is_authorized = true;
+    send_reply_true(c->sock, id);
+    
+    // Send initial diff
+    json_t *dreq = json_object();
+    json_object_set_new(dreq, "id", json_null());
+    json_object_set_new(dreq, "method", json_string("mining.set_difficulty"));
+    json_t *dparams = json_array();
+    
+    // Start with a reasonable difficulty, e.g. 2048 or config based
+    // For now hardcoded 2048
+    c->current_diff = 2048.0;
+    c->previous_diff = 2048.0;
+    c->last_retarget_time = time(NULL);
+    
+    json_array_append_new(dparams, json_real(c->current_diff));
+    json_object_set_new(dreq, "params", dparams);
+    char *ds = json_dumps(dreq, 0);
+    send_line(c->sock, ds);
+    free(ds);
+    json_decref(dreq);
+
+    // Send current job
+    Template tmpl;
+    if (bitcoin_get_latest_job(&tmpl)) {
+        // ... (notify logic duplication avoided by broadcast, but here we unicast)
+        // Re-implement unicast notify
+        json_t *nreq = json_object();
+        json_object_set_new(nreq, "id", json_null());
+        json_object_set_new(nreq, "method", json_string("mining.notify"));
+        json_t *nparams = json_array();
         
-        c->previous_diff = c->current_diff;
-        c->current_diff = new_diff;
+        json_array_append_new(nparams, json_string(tmpl.job_id));
+        json_array_append_new(nparams, json_string(tmpl.prev_hash_stratum));
         
-        send_difficulty(c, new_diff);
+        int v = c->coinbase_variant;
+        // fallback if variant not available in tmpl? tmpl has all.
+        json_array_append_new(nparams, json_string(tmpl.coinb1[v]));
+        json_array_append_new(nparams, json_string(tmpl.coinb2[v]));
         
-        Template t;
-        if (bitcoin_get_latest_job(&t)) {
-            t.clean_jobs = false; 
-            stratum_send_mining_notify(c->sock, &t);
-            bitcoin_free_job(&t);
+        json_t *merkle = json_array();
+        for (size_t i = 0; i < tmpl.merkle_count; i++) {
+            json_array_append_new(merkle, json_string(tmpl.merkle_branch[i]));
         }
+        json_array_append_new(nparams, merkle);
+        
+        json_array_append_new(nparams, json_string(tmpl.version_hex));
+        json_array_append_new(nparams, json_string(tmpl.nbits_hex));
+        json_array_append_new(nparams, json_string(tmpl.ntime_hex));
+        json_array_append_new(nparams, json_boolean(tmpl.clean_jobs));
+        
+        json_object_set_new(nreq, "params", nparams);
+        char *ns = json_dumps(nreq, 0);
+        send_line(c->sock, ns);
+        free(ns);
+        json_decref(nreq);
+        
+        bitcoin_free_job(&tmpl);
+    }
+
+    // [ECO MODE] Wake up if this is the first miner
+    if (stratum_get_client_count() == 1) {
+        log_info("💤 -> ⚡ First miner connected! Waking up gateway...");
+        bitcoin_update_template(true);
+    }
+}
+
+static void handle_submit(Client *c, json_t *id, json_t *params) {
+    if (!c->is_authorized) {
+        send_error(c->sock, id, 24, "Unauthorized");
+        return;
     }
     
-    c->last_retarget_time = now;
-    c->shares_in_window = 0;
-}
-// <<<<< 结束 <<<<<
-
-static bool is_fixed_hex(const char *s, size_t n) {
-    if (!s || strlen(s) != n) return false;
-    for (size_t i = 0; i < n; i++) {
-        unsigned char c = (unsigned char)s[i];
-        if (!isxdigit(c)) return false;
-    }
-    return true;
-}
-
-static bool is_all_digits(const char *s) {
-    if (!s || !*s) return false;
-    for (const char *p = s; *p; p++) {
-        if (*p < '0' || *p > '9') return false;
-    }
-    return true;
-}
-
-static void parse_nonce_auto(const char *s,
-                            bool *ok_dec, uint32_t *val_dec,
-                            bool *ok_hex, uint32_t *val_hex) {
-    if (ok_dec) *ok_dec = false;
-    if (ok_hex) *ok_hex = false;
-    if (val_dec) *val_dec = 0;
-    if (val_hex) *val_hex = 0;
-    if (!s || !*s) return;
-
-    bool has_hex_alpha = false;
-    for (const char *p = s; *p; p++) {
-        if ((*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F')) {
-            has_hex_alpha = true;
-            break;
-        }
+    // params: [worker, job_id, extranonce2, ntime, nonce]
+    if (json_array_size(params) < 5) {
+        send_error(c->sock, id, 20, "Invalid parameters");
+        return;
     }
 
-    if (is_fixed_hex(s, strlen(s))) {
-        char *end = NULL;
-        unsigned long v = strtoul(s, &end, 16);
-        if (end && *end == '\0' && v <= 0xffffffffUL) {
-            if (ok_hex) *ok_hex = true;
-            if (val_hex) *val_hex = (uint32_t)v;
-        }
+    const char *job_id = json_string_value(json_array_get(params, 1));
+    const char *en2 = json_string_value(json_array_get(params, 2));
+    const char *ntime = json_string_value(json_array_get(params, 3));
+    const char *nonce_hex = json_string_value(json_array_get(params, 4));
+
+    if (!job_id || !en2 || !ntime || !nonce_hex) {
+        send_error(c->sock, id, 20, "Invalid parameters");
+        return;
     }
-    if (has_hex_alpha) return;
-    if (is_all_digits(s)) {
-        char *end = NULL;
-        unsigned long v = strtoul(s, &end, 10);
-        if (end && *end == '\0' && v <= 0xffffffffUL) {
-            if (ok_dec) *ok_dec = true;
-            if (val_dec) *val_dec = (uint32_t)v;
-        }
+
+    uint32_t nonce = (uint32_t)strtoul(nonce_hex, NULL, 16);
+    uint32_t ntime_val = (uint32_t)strtoul(ntime, NULL, 16);
+
+    // Duplicate check
+    if (check_duplicate_share(nonce, en2, ntime_val)) {
+        send_error(c->sock, id, 22, "Duplicate share");
+        return;
     }
-}
 
-static void json_reply_error(json_t *res, int code, const char *msg) {
-    json_object_set_new(res, "result", json_false());
-    json_t *e = json_array();
-    json_array_append_new(e, json_integer(code));
-    json_array_append_new(e, json_string(msg));
-    json_object_set_new(res, "error", e);
-}
+    char full_en[64];
+    snprintf(full_en, sizeof(full_en), "%s%s", c->extranonce1_hex, en2);
 
-static Client* client_find_by_sock(int sock) {
-    Client *out = NULL;
-    pthread_mutex_lock(&g_clients_lock);
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (g_clients[i].active && g_clients[i].sock == sock) {
-            out = &g_clients[i];
-            break;
-        }
-    }
-    pthread_mutex_unlock(&g_clients_lock);
-    return out;
-}
-
-// [MODIFIED] Enhanced detection logic to include MiningRigRentals (MRR)
-static int detect_coinbase_variant(const char *ua) {
-    if (!ua) return CB_VARIANT_DEFAULT;
-    char ua_lower[128];
-    strncpy(ua_lower, ua, sizeof(ua_lower) - 1);
-    ua_lower[sizeof(ua_lower) - 1] = '\0';
-    for(int i=0; ua_lower[i]; i++) ua_lower[i] = (char)tolower((unsigned char)ua_lower[i]);
-
-    // Whatsminer
-    if (strstr(ua_lower, "whatsminer")) return CB_VARIANT_WHATSMINER;
+    // [New] Use current_diff or previous_diff?
+    // Simplified: use current_diff. Real pools handle diff transition gracefully.
+    double share_diff = 0.0;
     
-    // NiceHash / MRR
-    if (strstr(ua_lower, "nicehash") || 
-        strstr(ua_lower, "miningrigrentals") || 
-        strstr(ua_lower, "mrr")) 
-        return CB_VARIANT_NICEHASH;
+    // Validate
+    int res = bitcoin_validate_and_submit(job_id, full_en, ntime, nonce, 0, c->current_diff, &share_diff);
     
-    return CB_VARIANT_DEFAULT;
-}
-
-void stratum_send_mining_notify(int sock, Template *tmpl) {
-    if (!tmpl) return;
-
-    Client *c = client_find_by_sock(sock);
-    if (!c) return;
-
-    snprintf(c->last_job_id, sizeof(c->last_job_id), "%s", tmpl->job_id);
-
-    int v = c->coinbase_variant;
-    if (v < 0 || v >= MAX_COINBASE_VARIANTS) v = 0;
-
-    json_t *p = json_array();
-    json_array_append_new(p, json_string(tmpl->job_id));
-    json_array_append_new(p, json_string(tmpl->prev_hash_stratum));
-    json_array_append_new(p, json_string(tmpl->coinb1[v]));
-    json_array_append_new(p, json_string(tmpl->coinb2[v]));
-
-    json_t *m = json_array();
-    for (size_t i = 0; i < tmpl->merkle_count; i++) {
-        json_array_append_new(m, json_string(tmpl->merkle_branch[i]));
-    }
-    json_array_append_new(p, m);
-
-    json_array_append_new(p, json_string(tmpl->version_hex));
-    json_array_append_new(p, json_string(tmpl->nbits_hex));
-    json_array_append_new(p, json_string(tmpl->ntime_hex));
-    json_array_append_new(p, json_boolean(tmpl->clean_jobs));
-
-    json_t *r = json_object();
-    json_object_set_new(r, "id", json_null());
-    json_object_set_new(r, "method", json_string("mining.notify"));
-    json_object_set_new(r, "params", p);
-    send_json(sock, r);
-    json_decref(r);
-}
-
-void stratum_broadcast_job(Template *tmpl) {
-    int sockets[MAX_CLIENTS];
-    int count = 0;
-
-    pthread_mutex_lock(&g_clients_lock);
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (g_clients[i].active && g_clients[i].is_authorized) {
-            sockets[count++] = g_clients[i].sock;
-        }
-    }
-    pthread_mutex_unlock(&g_clients_lock);
-
-    for (int i = 0; i < count; i++) {
-        stratum_send_mining_notify(sockets[i], tmpl);
-    }
-    if (count > 0) log_info("Broadcast job %s (clean=%d) to %d miners", 
-                            tmpl->job_id, tmpl->clean_jobs, count);
-}
-
-// API Export
-json_t* stratum_get_stats(void) {
-    json_t *root = json_object();
-    json_t *workers = json_array();
-    double total_hashrate = 0;
-
-    struct BestShare {
-        double diff;
-        char worker[16];
-    } top3[3];
-    
-    for(int k=0; k<3; k++) { 
-        top3[k].diff = 0.0; 
-        memset(top3[k].worker, 0, sizeof(top3[k].worker)); 
-    }
-
-    pthread_mutex_lock(&g_clients_lock);
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (g_clients[i].active) {
-            json_t *w = json_object();
-            json_object_set_new(w, "id", json_integer(g_clients[i].id));
-            json_object_set_new(w, "ex1", json_string(g_clients[i].extranonce1_hex));
-            json_object_set_new(w, "ip", json_string(inet_ntoa(g_clients[i].addr.sin_addr)));
-            json_object_set_new(w, "ua", json_string(g_clients[i].user_agent));
-            json_object_set_new(w, "hashrate", json_real(g_clients[i].hashrate_est));
-            json_object_set_new(w, "diff", json_real(g_clients[i].current_diff));
-            json_object_set_new(w, "shares", json_integer(g_clients[i].total_shares));
-            json_object_set_new(w, "last_seen", json_integer((long)g_clients[i].last_submit_time));
-            json_array_append_new(workers, w);
-            total_hashrate += g_clients[i].hashrate_est;
-
-            if (g_clients[i].best_diff > 0) {
-                double d = g_clients[i].best_diff;
-                char *n = g_clients[i].extranonce1_hex;
-                for (int k = 0; k < 3; k++) {
-                    if (d > top3[k].diff) {
-                        for (int m = 2; m > k; m--) { top3[m] = top3[m-1]; }
-                        top3[k].diff = d;
-                        strncpy(top3[k].worker, n, 15);
-                        top3[k].worker[15] = '\0';
-                        break;
-                    }
-                }
+    if (res > 0) {
+        send_reply_true(c->sock, id);
+        
+        // Stats update
+        c->shares_in_window++;
+        c->total_shares++;
+        c->last_submit_time = time(NULL);
+        if (share_diff > c->best_diff) c->best_diff = share_diff;
+        
+        // Log valid share
+        record_share(c->extranonce1_hex, c->current_diff, "(hash_calc_inside)", (res == 2));
+        
+        // Vardiff Logic (Simple)
+        time_t now = time(NULL);
+        if (now - c->last_retarget_time > g_config.diff_retarget_interval) {
+            double spm = (double)c->shares_in_window / ((double)(now - c->last_retarget_time) / 60.0);
+            
+            double new_diff = c->current_diff;
+            if (spm > 20.0) new_diff *= 2.0;
+            else if (spm < 5.0) new_diff /= 2.0;
+            
+            if (new_diff < 1024.0) new_diff = 1024.0; // Min diff
+            
+            if (fabs(new_diff - c->current_diff) > 0.1) {
+                c->previous_diff = c->current_diff;
+                c->current_diff = new_diff;
+                
+                json_t *dreq = json_object();
+                json_object_set_new(dreq, "id", json_null());
+                json_object_set_new(dreq, "method", json_string("mining.set_difficulty"));
+                json_t *dparams = json_array();
+                json_array_append_new(dparams, json_real(c->current_diff));
+                json_object_set_new(dreq, "params", dparams);
+                char *ds = json_dumps(dreq, 0);
+                send_line(c->sock, ds);
+                free(ds);
+                json_decref(dreq);
+                
+                log_info("VarDiff ID=%d: %.0f -> %.0f (SPM: %.2f, Shares: %d)", 
+                         c->id, c->previous_diff, c->current_diff, spm, c->shares_in_window);
             }
+            
+            c->shares_in_window = 0;
+            c->last_retarget_time = now;
         }
-    }
-    pthread_mutex_unlock(&g_clients_lock);
-    
-    update_global_hashrate_history(total_hashrate);
 
-    json_object_set_new(root, "workers", workers);
-
-    uint32_t height = 0;
-    int64_t reward = 0;
-    double net_diff = 0.0;
-    bitcoin_get_telemetry(&height, &reward, &net_diff);
-    
-    json_t *blk = json_object();
-    json_object_set_new(blk, "height", json_integer(height));
-    json_object_set_new(blk, "reward", json_integer(reward));
-    json_object_set_new(blk, "net_diff", json_real(net_diff));
-    
-    json_t *top_shares_json = json_array();
-    for (int k = 0; k < 3; k++) {
-        if (top3[k].diff > 0) {
-            json_t *item = json_object();
-            json_object_set_new(item, "worker", json_string(top3[k].worker));
-            json_object_set_new(item, "diff", json_real(top3[k].diff));
-            json_array_append_new(top_shares_json, item);
-        }
+    } else {
+        send_error(c->sock, id, 21, "Job not found or invalid share");
     }
-    json_object_set_new(blk, "best_shares", top_shares_json);
-    
-    json_object_set_new(root, "block_info", blk);
-
-    json_t *logs = json_array();
-    pthread_mutex_lock(&g_stats_lock);
-    for(int i=0; i<MAX_SHARE_LOGS; i++) {
-        if (g_share_logs[i].timestamp != 0) {
-            json_t *l = json_object();
-            json_object_set_new(l, "worker", json_string(g_share_logs[i].worker_ex1));
-            json_object_set_new(l, "diff", json_real(g_share_logs[i].difficulty));
-            json_object_set_new(l, "hash", json_string(g_share_logs[i].share_hash));
-            json_object_set_new(l, "time", json_integer((long)g_share_logs[i].timestamp));
-            json_object_set_new(l, "is_block", json_boolean(g_share_logs[i].is_block));
-            json_array_append_new(logs, l);
-        }
-    }
-    
-    json_t *hist = json_array();
-    for(int i=0; i<HISTORY_POINTS; i++) {
-        json_array_append_new(hist, json_real(g_hashrate_history[i]));
-    }
-    pthread_mutex_unlock(&g_stats_lock);
-
-    json_object_set_new(root, "recent_shares", logs);
-    json_object_set_new(root, "history", hist);
-    
-    return root;
 }
 
-static void *client_worker(void *arg) {
+static void *client_thread(void *arg) {
     Client *c = (Client*)arg;
-    char buf[8192];
+    char buf[1024];
     int rpos = 0;
-
-    log_info("Worker connected: ID=%d IP=%s", c->id, inet_ntoa(c->addr.sin_addr));
-
-    while (c->active) {
-        ssize_t n = recv(c->sock, buf + rpos, sizeof(buf) - 1 - rpos, 0);
-
-        vardiff_check(c);
-
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                continue;
-            }
-            break; 
-        }
-        else if (n == 0) {
-            break; 
-        }
-
-        rpos += (int)n;
+    
+    while (1) {
+        int n = recv(c->sock, buf + rpos, sizeof(buf) - rpos - 1, 0);
+        if (n <= 0) break;
+        rpos += n;
         buf[rpos] = 0;
-
+        
         char *start = buf;
-        char *end;
-        while ((end = strchr(start, '\n')) != NULL) {
+        while (1) {
+            char *end = strchr(start, '\n');
+            if (!end) break;
             *end = 0;
-            if (*start) {
-                json_error_t e;
-                json_t *req = json_loads(start, 0, &e);
+            
+            if (strlen(start) > 0) {
+                json_error_t err;
+                json_t *req = json_loads(start, 0, &err);
                 if (req) {
-                    const char *m = json_string_value(json_object_get(req, "method"));
                     json_t *id = json_object_get(req, "id");
-                    json_t *res = json_object();
-                    if (id) json_object_set(res, "id", id);
-                    else json_object_set_new(res, "id", json_null());
-
-                    if (!m) {
-                        json_reply_error(res, 20, "Missing method");
-                        send_json(c->sock, res);
+                    const char *method = json_string_value(json_object_get(req, "method"));
+                    json_t *params = json_object_get(req, "params");
+                    
+                    if (method) {
+                        if (strcmp(method, "mining.subscribe") == 0) handle_subscribe(c, id, params);
+                        else if (strcmp(method, "mining.authorize") == 0) handle_authorize(c, id, params);
+                        else if (strcmp(method, "mining.submit") == 0) handle_submit(c, id, params);
+                        else if (strcmp(method, "mining.configure") == 0) send_reply_true(c->sock, id); 
                     }
-                    else if (strcmp(m, "mining.subscribe") == 0) {
-                        json_t *params = json_object_get(req, "params");
-                        if (params && json_is_array(params) && json_array_size(params) > 0) {
-                            const char *ua = json_string_value(json_array_get(params, 0));
-                            if (ua) {
-                                strncpy(c->user_agent, ua, sizeof(c->user_agent)-1);
-                                c->coinbase_variant = detect_coinbase_variant(c->user_agent);
-                                log_info("Client %d UA: %s (Variant: %d)", c->id, c->user_agent, c->coinbase_variant);
-                            }
-                        }
-
-                        json_object_set_new(res, "error", json_null());
-                        json_t *arr = json_array();
-                        json_t *subs = json_array();
-                        json_t *s1 = json_array();
-                        json_array_append_new(s1, json_string("mining.set_difficulty"));
-                        json_array_append_new(s1, json_string("1"));
-                        json_array_append_new(subs, s1);
-                        json_t *s2 = json_array();
-                        json_array_append_new(s2, json_string("mining.notify"));
-                        json_array_append_new(s2, json_string("1"));
-                        json_array_append_new(subs, s2);
-                        json_array_append_new(arr, subs);
-                        json_array_append_new(arr, json_string(c->extranonce1_hex));
-                        // 统一使用全局配置的 Extranonce2
-                        json_array_append_new(arr, json_integer(g_config.extranonce2_size));
-                        json_object_set_new(res, "result", arr);
-                        send_json(c->sock, res);
-                    }
-                    else if (strcmp(m, "mining.authorize") == 0) {
-                        c->is_authorized = true;
-                        json_object_set_new(res, "error", json_null());
-                        json_object_set_new(res, "result", json_true());
-                        send_json(c->sock, res);
-                        log_info("ID=%d authorized", c->id);
-                        send_difficulty(c, c->current_diff);
-                        Template t;
-                        if (bitcoin_get_latest_job(&t)) {
-                            t.clean_jobs = true; 
-                            stratum_send_mining_notify(c->sock, &t);
-                            bitcoin_free_job(&t);
-                        }
-                    }
-                    else if (strcmp(m, "mining.configure") == 0) {
-                        char ms[16];
-                        snprintf(ms, sizeof(ms), "%08x", g_config.version_mask);
-                        json_object_set_new(res, "error", json_null());
-                        json_t *r = json_object();
-                        json_object_set_new(r, "version-rolling", json_true());
-                        json_object_set_new(r, "version-rolling.mask", json_string(ms));
-                        json_object_set_new(res, "result", r);
-                        send_json(c->sock, res);
-                    }
-                    else if (strcmp(m, "mining.submit") == 0) {
-                        json_t *p = json_object_get(req, "params");
-                        if (!p || !json_is_array(p) || json_array_size(p) < 5) {
-                            json_reply_error(res, 20, "Bad params");
-                            send_json(c->sock, res);
-                            json_decref(res); json_decref(req); start = end + 1; continue;
-                        }
-
-                        const char *jid = json_string_value(json_array_get(p, 1));
-                        const char *en2 = json_string_value(json_array_get(p, 2));
-                        const char *nt  = json_string_value(json_array_get(p, 3));
-                        const char *nh  = json_string_value(json_array_get(p, 4));
-                        const char *vh  = NULL;
-                        if (json_array_size(p) >= 6) vh = json_string_value(json_array_get(p, 5));
-                        if (!vh) vh = "";
-
-                        if (!jid || strlen(jid) == 0 ||
-                            !en2 || !is_fixed_hex(en2, (size_t)g_config.extranonce2_size * 2) ||
-                            !nt  || !is_fixed_hex(nt, 8) ||
-                            !nh  || strlen(nh) == 0 ||
-                            (strlen(vh) > 0 && !is_fixed_hex(vh, 8))) {
-                            json_reply_error(res, 20, "Invalid submit fields");
-                            send_json(c->sock, res);
-                            json_decref(res); json_decref(req); start = end + 1; continue;
-                        }
-
-                        uint32_t version_bits = 0;
-                        if (vh[0]) version_bits = (uint32_t)strtoul(vh, NULL, 16);
-
-                        bool ok_dec = false, ok_hex = false;
-                        uint32_t nonce_dec = 0, nonce_hex = 0;
-                        parse_nonce_auto(nh, &ok_dec, &nonce_dec, &ok_hex, &nonce_hex);
-                        if (!ok_dec && !ok_hex) {
-                            json_reply_error(res, 20, "Invalid nonce");
-                            send_json(c->sock, res);
-                            json_decref(res); json_decref(req); start = end + 1; continue;
-                        }
-
-                        char full_extranonce[128];
-                        snprintf(full_extranonce, sizeof(full_extranonce), "%s%s", c->extranonce1_hex, en2);
-
-                        const char *jid_used = jid;
-                        int ret = 0;
-                        double actual_share_diff = 0.0;
-                        
-                        double check_diff = c->current_diff;
-                        if (c->previous_diff > 0.0 && c->previous_diff < check_diff) {
-                            check_diff = c->previous_diff;
-                        }
-
-                        if (ok_dec) ret = bitcoin_validate_and_submit(jid, full_extranonce, nt, nonce_dec, version_bits, check_diff, &actual_share_diff);
-                        if (ret == 0 && ok_hex) ret = bitcoin_validate_and_submit(jid, full_extranonce, nt, nonce_hex, version_bits, check_diff, &actual_share_diff);
-
-                        if (ret == 0 && c->last_job_id[0] && strcmp(c->last_job_id, jid) != 0) {
-                            jid_used = c->last_job_id;
-                            if (ok_dec) ret = bitcoin_validate_and_submit(jid_used, full_extranonce, nt, nonce_dec, version_bits, check_diff, &actual_share_diff);
-                            if (ret == 0 && ok_hex) ret = bitcoin_validate_and_submit(jid_used, full_extranonce, nt, nonce_hex, version_bits, check_diff, &actual_share_diff);
-                        }
-
-                        // Duplicate Check (Error 22)
-                        char keybuf[256];
-                        snprintf(keybuf, sizeof(keybuf), "%s|%s|%s|%s|%s|%d", jid_used, c->extranonce1_hex, en2, nt, nh, c->id);
-                        uint64_t fp = fnv1a64(keybuf, strlen(keybuf));
-                        if (is_duplicate_share_fp(fp)) {
-                            json_reply_error(res, 22, "Duplicate share");
-                            send_json(c->sock, res);
-                            json_decref(res); json_decref(req); start = end + 1; continue;
-                        }
-
-                        if (ret == 0) {
-                            if (actual_share_diff < 0.000001) {
-                                json_reply_error(res, 21, "Job not found (=Stale)");
-                            } else {
-                                json_reply_error(res, 23, "Low difficulty share");
-                            }
-                        } else {
-                            bool accept = false;
-                            
-                            if (actual_share_diff >= c->current_diff) {
-                                accept = true;
-                            } else if (c->previous_diff > 0.0 && actual_share_diff >= c->previous_diff) {
-                                accept = true; 
-                            }
-
-                            if (!accept) {
-                                json_reply_error(res, 23, "Low difficulty share");
-                            } else {
-                                json_object_set_new(res, "result", json_true());
-                                json_object_set_new(res, "error", json_null());
-
-                                // Stats Update
-                                c->shares_in_window++;
-                                c->total_shares++;
-                                time_t now = time(NULL);
-                                c->last_submit_time = now;
-                                
-                                if (actual_share_diff > c->best_diff) {
-                                    c->best_diff = actual_share_diff;
-                                }
-
-                                double share_work = c->current_diff * 4294967296.0; 
-                                double dt_est = difftime(now, c->last_retarget_time);
-                                if (dt_est < 1.0) dt_est = 1.0;
-                                double instant_hr = share_work / dt_est * c->shares_in_window;
-                                if (c->hashrate_est == 0) c->hashrate_est = instant_hr;
-                                else c->hashrate_est = c->hashrate_est * 0.95 + instant_hr * 0.05;
-
-                                record_share(c->extranonce1_hex, actual_share_diff, "Valid Share", (ret == 2));
-
-                                vardiff_check(c);
-                            }
-                        }
-                        send_json(c->sock, res);
-                    }
-                    else {
-                        json_reply_error(res, 20, "Unknown method");
-                        send_json(c->sock, res);
-                    }
-                    json_decref(res); json_decref(req);
+                    json_decref(req);
                 }
             }
+            
             start = end + 1;
         }
 
@@ -742,21 +415,86 @@ static void *server_thread(void *arg) {
     while (1) {
         struct sockaddr_in c_addr;
         socklen_t l = sizeof(c_addr);
-        int ns = accept(sfd, (struct sockaddr *)&c_addr, &l);
-        if (ns >= 0) {
-            Client *c = client_add(ns, c_addr);
-            if (c) {
-                pthread_create(&c->thread_id, NULL, client_worker, c);
-                pthread_detach(c->thread_id);
-            } else {
-                close(ns);
+        int cfd = accept(sfd, (struct sockaddr *)&c_addr, &l);
+        if (cfd >= 0) {
+            pthread_mutex_lock(&g_clients_lock);
+            int idx = -1;
+            for (int i = 0; i < MAX_CLIENTS; i++) {
+                if (!g_clients[i].active) {
+                    idx = i;
+                    break;
+                }
             }
+            if (idx >= 0) {
+                g_clients[idx].id = idx + 1;
+                g_clients[idx].sock = cfd;
+                g_clients[idx].addr = c_addr;
+                g_clients[idx].active = true;
+                g_clients[idx].is_authorized = false;
+                g_clients[idx].total_shares = 0;
+                g_clients[idx].shares_in_window = 0;
+                g_clients[idx].best_diff = 0;
+                g_clients[idx].hashrate_est = 0;
+                g_clients[idx].last_submit_time = 0;
+                g_clients[idx].coinbase_variant = CB_VARIANT_DEFAULT;
+                pthread_create(&g_clients[idx].thread_id, NULL, client_thread, &g_clients[idx]);
+                log_info("Client %d connected from %s", idx + 1, inet_ntoa(c_addr.sin_addr));
+            } else {
+                close(cfd);
+                log_error("Too many clients, rejected");
+            }
+            pthread_mutex_unlock(&g_clients_lock);
         }
     }
     return NULL;
 }
 
-int stratum_start_thread(void) {
+void stratum_broadcast_job(const Template *tmpl) {
+    if (!tmpl->valid) return;
+    
+    // Pre-calculate JSON strings for variants
+    char *notifies[MAX_COINBASE_VARIANTS];
+    
+    for (int v = 0; v < MAX_COINBASE_VARIANTS; v++) {
+        json_t *nreq = json_object();
+        json_object_set_new(nreq, "id", json_null());
+        json_object_set_new(nreq, "method", json_string("mining.notify"));
+        json_t *nparams = json_array();
+        
+        json_array_append_new(nparams, json_string(tmpl->job_id));
+        json_array_append_new(nparams, json_string(tmpl->prev_hash_stratum));
+        json_array_append_new(nparams, json_string(tmpl->coinb1[v]));
+        json_array_append_new(nparams, json_string(tmpl->coinb2[v]));
+        
+        json_t *merkle = json_array();
+        for (size_t i = 0; i < tmpl.merkle_count; i++) {
+            json_array_append_new(merkle, json_string(tmpl->merkle_branch[i]));
+        }
+        json_array_append_new(nparams, merkle);
+        
+        json_array_append_new(nparams, json_string(tmpl->version_hex));
+        json_array_append_new(nparams, json_string(tmpl->nbits_hex));
+        json_array_append_new(nparams, json_string(tmpl->ntime_hex));
+        json_array_append_new(nparams, json_boolean(tmpl->clean_jobs));
+        
+        json_object_set_new(nreq, "params", nparams);
+        notifies[v] = json_dumps(nreq, 0);
+        json_decref(nreq);
+    }
+    
+    pthread_mutex_lock(&g_clients_lock);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (g_clients[i].active && g_clients[i].is_authorized) {
+            int v = g_clients[i].coinbase_variant;
+            send_line(g_clients[i].sock, notifies[v]);
+        }
+    }
+    pthread_mutex_unlock(&g_clients_lock);
+    
+    for (int v = 0; v < MAX_COINBASE_VARIANTS; v++) free(notifies[v]);
+}
+
+int stratum_start(void) {
     pthread_t t;
     return pthread_create(&t, NULL, server_thread, NULL);
 }

@@ -22,7 +22,7 @@ int main(int argc, char *argv[]) {
     const char *conf_file = "config.json";
     if (argc > 2 && strcmp(argv[1], "-c") == 0) conf_file = argv[2];
 
-    log_info("Starting Satoshi Gateway (Production)...");
+    log_info("Starting Satoshi Gateway (Perfect Arch)...");
     if (load_config(conf_file) != 0) {
         log_error("Config load failed.");
         return 1;
@@ -37,29 +37,31 @@ int main(int argc, char *argv[]) {
     if (bitcoin_init() != 0) return 1;
     if (stratum_start_thread() != 0) return 1;
 
-    // 1. Start ZMQ (Updates template reliably but with latency)
+    // Start ZMQ (Local backup)
     zmq_listener_start();
     
-    // 2. Start Web
     web_server_start(8080); 
 
     log_info("Gateway ready on port %d.", g_config.stratum_port);
 
-    // 3. First RPC Sync (Get initial block template & Height)
-    log_info("Performing initial RPC sync...");
+    // Initial Sync
     bitcoin_update_template(true);
     time_t last_check = time(NULL);
 
-    // 4. Get Current Height for P2P Handshake
     uint32_t current_height = 0;
     bitcoin_get_telemetry(&current_height, NULL, NULL);
-    if (current_height == 0) {
-        log_error("Warning: Initial RPC failed, P2P will start with height 0 (Slow push)");
+
+    // 1. Fast P2P (Remote/Primary)
+    if (strlen(g_config.p2p_host) > 0) {
+        log_info("Starting Fast P2P Listener -> %s:%d", g_config.p2p_host, g_config.p2p_port);
+        p2p_start_thread(g_config.p2p_host, g_config.p2p_port, g_config.p2p_magic, (int32_t)current_height);
     }
 
-    // 5. Start P2P Listener (Now that we know the height)
-    log_info("Starting P2P with initial height: %d", current_height);
-    p2p_start_thread(g_config.p2p_host, g_config.p2p_port, g_config.p2p_magic, (int32_t)current_height);
+    // 2. Local P2P (Secondary/Bridge)
+    if (strlen(g_config.local_p2p_host) > 0) {
+        log_info("Starting Local P2P Listener -> %s:%d", g_config.local_p2p_host, g_config.local_p2p_port);
+        p2p_start_thread(g_config.local_p2p_host, g_config.local_p2p_port, g_config.p2p_magic, (int32_t)current_height);
+    }
 
     while (1) {
         if (g_block_notify) {

@@ -28,12 +28,11 @@ typedef struct {
     bool is_authorized;
     pthread_t thread_id;
 
-    // [MODIFIED] Expanded from [9] to [17] to support up to 8 bytes hex in future
     char extranonce1_hex[17];
     char last_job_id[STRATUM_JOBID_MAX];
 
     double current_diff;
-    double previous_diff; // 记录上一个难度，用于过渡期验证
+    double previous_diff; 
     time_t last_retarget_time;
     int shares_in_window;
     
@@ -41,18 +40,17 @@ typedef struct {
     double hashrate_est;
     time_t last_submit_time;
     uint64_t total_shares;
-    
     double best_diff; 
     
-    // 客户端标识
     char user_agent[128];
     int coinbase_variant; 
 } Client;
 
-void stratum_send_mining_notify(int sock, Template *tmpl);
 void stratum_broadcast_job(Template *tmpl);
 int stratum_start_thread(void);
+void stratum_send_mining_notify(int sock, Template *tmpl);
 
-json_t* stratum_get_stats(void);
+// [NEW] API for Eco Mode
+int stratum_get_client_count(void);
 
 #endif

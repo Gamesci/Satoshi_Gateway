@@ -46,11 +46,15 @@ typedef struct {
     int coinbase_variant; 
 } Client;
 
-void stratum_broadcast_job(Template *tmpl);
+// [修复] 统一使用 const Template *
+void stratum_broadcast_job(const Template *tmpl);
+void stratum_send_mining_notify(int sock, const Template *tmpl);
 int stratum_start_thread(void);
-void stratum_send_mining_notify(int sock, Template *tmpl);
 
 // [NEW] API for Eco Mode
 int stratum_get_client_count(void);
+
+// [NEW] API for Web Stats
+json_t* stratum_get_stats(void);
 
 #endif

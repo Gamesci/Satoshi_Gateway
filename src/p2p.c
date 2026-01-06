@@ -264,15 +264,23 @@ static void *p2p_thread_func(void *arg) {
             // 接收数据 (1秒超时，保证上面的定时器能被及时触发)
             ssize_t n = recv(sock, recv_buf + buf_len, P2P_RECV_BUF_SIZE - buf_len, 0);
             
-            if (n <= 0) {
-                // 检查是否是超时 (EAGAIN/EWOULDBLOCK)
+            // [修复] 正确处理 n > 0, n == 0, n < 0 的情况
+            if (n > 0) {
+                // 收到数据，继续处理
+                buf_len += n;
+            } else if (n == 0) {
+                // 连接关闭 (EOF)
+                log_error("P2P: Socket disconnected (EOF)");
+                break; // 退出内层循环，触发重连
+            } else {
+                // n < 0，检查是否是超时
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
                     continue; // 只是超时，继续循环检查定时器
                 }
-                log_error("P2P: Socket disconnected");
-                break;
+                // 真正的套接字错误
+                log_error("P2P: Socket error: %s", strerror(errno));
+                break; // 退出内层循环，触发重连
             }
-            buf_len += n;
 
             while (buf_len >= 24) {
                 p2p_hdr_t *hdr = (p2p_hdr_t*)recv_buf;
